@@ -1,0 +1,32 @@
+# Per-machine configuration and credentials
+/start.local.bat
+.env
+.env.*
+!.env.example
+*.local.json
+
+# Local stories, exports, models and runtime binaries
+/data/
+/models/
+/runtime/
+*.gguf
+*.safetensors
+*.exe
+*.dll
+
+# Browser sessions, generated screenshots and local handoff notes
+/.playwright-cli/
+/output/
+/项目交接文档.md
+
+# Editor, dependency and temporary files
+/.vscode/
+/.idea/
+node_modules/
+__pycache__/
+*.pyc
+*.log
+*.tmp
+*.bak
+Thumbs.db
+.DS_Store

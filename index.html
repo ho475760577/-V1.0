@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>叙境 StoryRealm · v1.0</title>
+<meta name="description" content="叙境 StoryRealm：连接本地模型的互动小说与角色创作平台。AI 辅助构思世界、人物和开场，由你决定故事走向。">
+<link rel="stylesheet" href="css/style.css?v=20261011-v1.0.0">
+</head>
+<body>
+
+<!-- 顶栏 -->
+<header class="topbar">
+  <div class="tb-left">
+    <span class="logo">◆</span>
+    <span class="app-brand">叙境 <span class="app-version">v1.0</span></span>
+    <span id="chatTitle" class="tb-title">作品</span>
+  </div>
+  <div class="tb-right">
+    <span id="healthDot" class="dot"></span>
+    <span id="healthTxt" class="tb-health">检测中…</span>
+    <input id="apiBase" class="api-input" placeholder="http://127.0.0.1:8080" title="llama-server 地址">
+    <button id="refreshBtn" class="tb-btn">刷新</button>
+    <span id="statHit" class="tb-stat"></span>
+  </div>
+</header>
+
+<div class="layout">
+
+  <!-- 左栏：作品列表 -->
+  <aside class="side">
+    <div class="side-head">
+      <span>作品</span>
+      <button id="newBtn" class="mini-btn primary">+ 新建</button>
+    </div>
+    <div id="configList" class="cfg-list"></div>
+    <div class="side-foot">
+      <label class="mini">名称</label>
+      <input id="cfgName" class="side-name" placeholder="作品名称">
+    </div>
+  </aside>
+
+  <!-- 中栏：聊天 -->
+  <main class="chat">
+    <div id="castBar" class="cast-bar"></div>
+    <div id="statePanel" class="state-panel" hidden></div>
+    <div id="msgList" class="msg-list"></div>
+    <div class="composer">
+      <textarea id="chatInput" rows="3" placeholder="输入内容，Enter 发送，Shift+Enter 换行"></textarea>
+      <div class="comp-bar">
+        <button id="clearChat" class="mini-btn">清空对话</button>
+        <div class="comp-right">
+          <button id="personaChip" class="persona-chip"></button>
+          <button id="sendBtn" class="send-btn">发送</button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- 右栏：配置 -->
+  <section class="config">
+    <div class="tabs">
+      <button class="tab on" data-tab="card">角色卡</button>
+      <button class="tab" data-tab="persona">我的身份</button>
+      <button class="tab" data-tab="length">篇幅</button>
+      <button class="tab" data-tab="basic">基础设置</button>
+      <button class="tab" data-tab="world">世界书</button>
+      <button class="tab" data-tab="other">其他</button>
+      <button class="tab" data-tab="debug">调试</button>
+    </div>
+
+    <!-- 我的身份 -->
+    <div id="pane-persona" class="tabpane" style="display:none">
+      <div class="pane-hint">
+        设置「我」的性别、年龄、外貌、身份与性格，以及能力、目标和相处偏好。写一句构思即可让 AI 补全或优化。已填资料会进入提示词；备注仅自己可见。身份资料是共享库，每个作品单独绑定。
+      </div>
+      <div id="personaBox"></div>
+    </div>
+
+    <!-- 篇幅 -->
+    <div id="pane-length" class="tabpane" style="display:none">
+      <div class="pane-hint">
+        选择正文的目标篇幅，修改后点击应用。每个作品单独保存。
+        状态栏、记忆和选项另留输出空间；实际字数取决于模型与上下文。
+      </div>
+
+      <div id="lenPresets" class="len-list"></div>
+
+      <label class="mini">篇幅提示词（应用为独立的「篇幅要求」设定块）</label>
+      <textarea id="lenPrompt" rows="16"></textarea>
+
+      <div class="btn-row">
+        <button id="lenApply" class="mini-btn primary">应用到作品设定</button>
+        <button id="lenCopy" class="mini-btn">复制全文</button>
+      </div>
+
+      <div id="lenStat" class="len-stat"></div>
+    </div>
+
+    <!-- 角色卡 -->
+    <div id="pane-card" class="tabpane">
+      <div class="pane-hint">
+        先用一句话描述你想要的角色，AI 会给出 4 个方向让你挑；选定后再展开成完整设定。角色卡是共享库，每个作品会单独绑定当前角色。
+      </div>
+
+      <!-- AI 创作入口 -->
+      <div class="ai-create">
+        <label class="mini">你想要个什么样的角色？</label>
+        <textarea id="aiBrief" rows="2" placeholder="例如：会武功的.library员，表面冷漠其实很护短"></textarea>
+        <div class="btn-row">
+          <button id="aiDirBtn" class="mini-btn primary">AI 生成方向</button>
+          <button id="aiExpandBtn" class="mini-btn" disabled>展开选中方向</button>
+        </div>
+        <label class="mini story-label">或者粘贴完整故事，让 AI 自动分类</label>
+        <textarea id="aiStory" rows="5" placeholder="把世界背景、人物关系、开场剧情整段粘贴到这里"></textarea>
+        <button id="aiOrganizeBtn" class="mini-btn primary">AI 整理并回填角色卡</button>
+        <div id="aiStatus" class="ai-status"></div>
+      </div>
+
+      <!-- 方向选项 -->
+      <div id="dirList" class="dir-list"></div>
+
+      <div class="tpl-block">
+        <label class="mini">或者套个模板（不消耗时间，可再 AI 扩写）</label>
+        <div id="tplList" class="tpl-list"></div>
+      </div>
+
+      <div class="card-switch">
+        <label class="mini">选择角色卡</label>
+        <div class="btn-row">
+          <select id="cardSelect" class="card-sel"></select>
+          <button id="newCardBtn" class="mini-btn">新建</button>
+          <button id="delCardBtn" class="mini-btn">删除</button>
+        </div>
+      </div>
+
+      <div id="cardEditor" class="card-editor"></div>
+    </div>
+
+    <!-- 基础设置 -->
+    <div id="pane-basic" class="tabpane" style="display:none">
+      <div class="pane-hint">
+        每个块都有「插入顺序」，数字越小越靠前。所有启用的块按顺序拼成系统提示词。
+      </div>
+      <div id="blockList" class="block-list"></div>
+      <button id="addBlock" class="add-btn">+ 添加设定块</button>
+    </div>
+
+    <!-- 世界书 -->
+    <div id="pane-world" class="tabpane" style="display:none">
+      <div class="pane-hint">
+        把「不必随时触发」的设定放这里，命中关键词才注入，省 token。<br>
+        <b>影响范围</b>：提示词=并入系统 · 前置词=紧贴历史之前 · 后置词=权重最高
+      </div>
+      <div id="entryList" class="entry-list"></div>
+      <button id="addEntry" class="add-btn">+ 添加条目</button>
+    </div>
+
+    <!-- 其他 -->
+    <div id="pane-other" class="tabpane" style="display:none">
+      <div class="pane-hint">变量面板可让模型维护游戏状态，聊天中以状态栏形式展示。</div>
+
+      <label class="chk big"><input id="varsOn" type="checkbox">启用变量面板</label>
+      <div id="varsPanel" style="display:none">
+        <label class="mini">变量提示词（告诉模型如何维护状态）</label>
+        <textarea id="varsPrompt" rows="6" placeholder="例如：请在每次回复末尾用 JSON 输出当前状态..."></textarea>
+
+        <label class="mini">历史轮数上限</label>
+        <input id="varsHistory" type="number" value="20" min="2" max="100">
+      </div>
+
+      <hr>
+      <label class="chk big"><input id="memoryOn" type="checkbox">启用摘要记忆</label>
+      <div id="memoryPanel" style="display:none">
+        <label class="mini">当前摘要（会带入后续提示词）</label>
+        <textarea id="memorySummary" rows="5" placeholder="还没有摘要。对话变长后会自动生成，也可以手动生成。"></textarea>
+        <div class="memory-row">
+          <label class="mini">触发消息数 <input id="memoryThreshold" type="number" value="20" min="6" max="100"></label>
+          <label class="mini">保留最近消息 <input id="memoryKeep" type="number" value="8" min="2" max="30"></label>
+          <button id="summarizeBtn" class="mini-btn">立即生成摘要</button>
+        </div>
+        <div id="memoryStatus" class="ai-status"></div>
+      </div>
+
+      <hr>
+      <label class="chk big"><input id="choicesOn" type="checkbox">让 AI 提供 4 个行动选项</label>
+      <div class="pane-hint">选项只会填入输入框，不会自动发送；也可以完全忽略，自己输入。</div>
+
+      <hr>
+      <label class="chk big"><input id="formatOn" type="checkbox">启用结构化剧情格式</label>
+      <div id="formatPanel" style="display:none">
+        <div class="pane-hint">正文采用小说式叙述，台词使用中文双引号“”；场景、状态和剧情记忆放进可解析标签。</div>
+        <label class="chk"><input id="formatReview" type="checkbox">显示简短演绎检查</label>
+      </div>
+
+      <label class="mini">开场白（进入聊天时的第一段）</label>
+      <textarea id="greetingBox" rows="5" placeholder="像小说一样直接描写动作与神态，台词使用中文双引号“”"></textarea>
+
+      <hr>
+      <div class="pane-hint">配置可导出为 JSON，方便备份或分享给朋友。</div>
+      <div class="btn-row">
+        <button id="exportBtn" class="mini-btn">导出配置</button>
+        <button id="importBtn" class="mini-btn">导入配置</button>
+        <input id="importFile" type="file" accept=".json" hidden>
+      </div>
+    </div>
+
+    <!-- 调试 -->
+    <div id="pane-debug" class="tabpane" style="display:none">
+      <div class="pane-hint">这是即将发送给模型的完整内容。排查问题先看这里。</div>
+      <div class="btn-row">
+        <button id="refreshPreview" class="mini-btn">刷新预览</button>
+      </div>
+      <div id="previewStat" class="pv-stat"></div>
+      <div id="previewBox" class="preview-box"></div>
+    </div>
+  </section>
+</div>
+
+<dialog id="storyCreator" class="story-creator" aria-labelledby="storyCreatorTitle">
+  <div id="storyCreatorBody"></div>
+</dialog>
+
+<!-- 更新前端脚本时同步递增所有模块的版本，避免新旧缓存混用。 -->
+<script type="importmap">
+{
+  "imports": {
+    "./js/assembler.js": "./js/assembler.js?v=20261011-v1.0.0",
+    "./js/card-panel.js": "./js/card-panel.js?v=20261011-v1.0.0",
+    "./js/card.js": "./js/card.js?v=20261011-v1.0.0",
+    "./js/json-utils.js": "./js/json-utils.js?v=20261011-v1.0.0",
+    "./js/llm.js": "./js/llm.js?v=20261011-v1.0.0",
+    "./js/main.js": "./js/main.js?v=20261011-v1.0.0",
+    "./js/narrative.js": "./js/narrative.js?v=20261011-v1.0.0",
+    "./js/persona.js": "./js/persona.js?v=20261011-v1.0.0",
+    "./js/profile-assist.js": "./js/profile-assist.js?v=20261011-v1.0.0",
+    "./js/profile.js": "./js/profile.js?v=20261011-v1.0.0",
+    "./js/prompts.js": "./js/prompts.js?v=20261011-v1.0.0",
+    "./js/render.js": "./js/render.js?v=20261011-v1.0.0",
+    "./js/store.js": "./js/store.js?v=20261011-v1.0.0",
+    "./js/story-creator-panel.js": "./js/story-creator-panel.js?v=20261011-v1.0.0",
+    "./js/story-creator.js": "./js/story-creator.js?v=20261011-v1.0.0"
+  }
+}
+</script>
+<script type="module" src="js/main.js?v=20261011-v1.0.0"></script>
+</body>
+</html>
