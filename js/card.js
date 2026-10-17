@@ -28,6 +28,14 @@ export function makeCard(overrides = {}) {
     personality: '',     // 性格
     background: '',      // 背景
     speechStyle: '',     // 说话方式与口癖
+    shortTermGoal: '',
+    longTermGoal: '',
+    fear: '',
+    need: '',
+    contradiction: '',
+    boundaries: '',
+    behaviorCues: '',
+    arc: '',
     scenario: '',        // 故事开始的情境
     firstMes: '',        // 开场白
     mesExample: '',      // 示例对话
@@ -220,7 +228,7 @@ const STORY_CLASSIFY_PROMPT = `你是角色卡整理助手。用户会粘贴一�
 - background：角色过去经历、身份、关系来源
 - speechStyle：说话方式、语气、口头禅
 - scenario：故事大背景、当前处境、玩家与角色的关系、旅程或事件目标
-- firstMes：适合作为第一次回复的开场场景。只写一个自然的开场，不要替用户做决定
+- firstMes：适合作为第一次回复的开场场景。玩家承接最多占正文10%，不要替用户决定关键行动
 - mesExample：2-3 轮简短示例对话，示范角色语气
 - creatorNotes：不适合放进角色正文、但对长期演绎有帮助的规则；没有则留空
 
@@ -378,7 +386,10 @@ export function exportCard(card) {
       tagline: card.tagline || '',
       speechStyle: card.speechStyle || '',
       background: card.background || '',
-      extensions: { sil_profile: profile },
+      extensions: { sil_profile: profile, sil_story: Object.fromEntries(
+        ['shortTermGoal', 'longTermGoal', 'fear', 'need', 'contradiction', 'boundaries', 'behaviorCues', 'arc']
+          .map((key) => [key, card[key] || ''])
+      ) },
     },
   }, null, 2);
 }
@@ -439,6 +450,7 @@ export function importCard(json) {
     creatorNotes: noteRest.join('\n').trim(),
     tags: data.tags || [],
     avatar: data.avatar || '',
+    ...(data.extensions?.sil_story || {}),
     ...normalizeProfile(data.extensions?.sil_profile || data),
   });
 }
@@ -459,8 +471,20 @@ export function cardToBlocks(card) {
   const desc = [card.name && `姓名：${card.name}`, card.tagline && `身份：${card.tagline}`,
     profileToText(card), card.appearance, card.personality, card.background]
     .filter(Boolean).join('\n\n');
+  const drive = [
+    card.shortTermGoal && `短期目标：${card.shortTermGoal}`,
+    card.longTermGoal && `长期目标：${card.longTermGoal}`,
+    card.fear && `恐惧：${card.fear}`,
+    card.need && `内在需求：${card.need}`,
+    card.contradiction && `内在矛盾：${card.contradiction}`,
+    card.boundaries && `底线与边界：${card.boundaries}`,
+    card.behaviorCues && `行为线索：${card.behaviorCues}`,
+    card.arc && `人物弧光：${card.arc}`,
+  ].filter(Boolean).join('\n');
   if (desc) {
-    blocks.push({ name: '角色设定', content: desc, order: 1 });
+    blocks.push({ name: '角色设定', content: [desc, drive && `【角色动机与弧光】\n${drive}`].filter(Boolean).join('\n\n'), order: 1 });
+  } else if (drive) {
+    blocks.push({ name: '角色设定', content: `【角色动机与弧光】\n${drive}`, order: 1 });
   }
 
   if (card.speechStyle) {

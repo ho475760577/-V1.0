@@ -1,19 +1,24 @@
 /**
  * 主界面逻辑
  */
-import { assemble, makeBlock, makeEntry, SCAN, MATCH, SCOPE, exportConfig, importConfig } from './assembler.js';
+import { assemble, makeBlock, makeEntry, SCAN, MATCH, SCOPE, ENTRY_TYPE_LABELS, exportConfig, importConfig } from './assembler.js';
 import { llm, LLM } from './llm.js';
 import * as store from './store.js';
-import { parseReply, parseState, parseStructuredReply, buildPanelFrame, formatText, escapeHtml } from './render.js';
+import { parseReply, parseState, parseStructuredReply, serializeStructuredReply, buildPanelFrame, formatText, escapeHtml } from './render.js';
 import { initCard, selectCard as selectEditorCard } from './card-panel.js';
 import { makePersona, personaToBlock, compressImage, avatarPlaceholder, PERSONA_PRESETS } from './persona.js';
-import { LENGTH_PRESETS, getPrompt, SUGGESTED_TOKENS, getLengthSettings, applyLengthSettings, generationOptions } from './prompts.js';
+import { getBodyLength, getBodyTarget, MAX_BODY_CHARS, TARGET_BODY_CHARS, generationOptions } from './prompts.js';
 import { profileEditor } from './profile.js';
 import { profileAIEditor, bindProfileAI } from './profile-assist.js';
 import { migrateNarrativeInstructions } from './narrative.js';
 import { openStoryCreator } from './story-creator-panel.js';
+import { mergeMemory, memoryToMarkdown, normalizeMemory, parseMemoryMarkdown } from './memory.js';
 
 const $ = (id) => document.getElementById(id);
+const EMPTY_SCENE = {
+  time: '', world: '', location: '', plot: '', weather: '', atmosphere: '', lighting: '',
+  sounds: [], scents: [], participants: [], objects: [], goal: '', conflict: '', tension: '',
+};
 
 /* ============ 应用状态 ============ */
 const state = {
@@ -25,6 +30,7 @@ const state = {
   busy: false,
   memoryBusy: false,
   streaming: false,
+  contextVersion: 0,
   tab: 'card',
 };
 
@@ -32,7 +38,8 @@ const getCard = () => (state.cardId ? store.loadCard(state.cardId) : null);
 const getPersona = () => (state.personaId ? store.loadPersona(state.personaId) : null);
 
 /* ============ 初始化 ============ */
-function init() {
+async function init() {
+  await store.initializePersistence();
   llm.base = store.getApiBase();
   $('apiBase').value = llm.base;
 
@@ -48,7 +55,6 @@ function init() {
   renderEntries();
   renderVars();
   renderPersona();
-  renderLength();
   bindEvents();
   checkHealth();
 
@@ -62,16 +68,17 @@ function init() {
 
 /* ============ 作品管理 ============ */
 function newConfig() {
+  state.contextVersion += 1;
   state.configId = 'cfg_' + Date.now().toString(36);
   state.cfg = {
     name: '新作品',
     blocks: [makeBlock({ name: '主提示词', order: 0, content: '你是一个角色扮演引擎。请沉浸地扮演角色。' })],
     entries: [],
     vars: { enabled: false, prompt: '', historyLimit: 20 },
-    memory: { enabled: false, summary: '', threshold: 20, keepRecent: 8 },
+    memory: { enabled: false, summary: '', markdown: '', threshold: 20, keepRecent: 8, shortTerm: [], longTerm: [] },
     choices: { enabled: false },
     responseFormat: { enabled: true, showReview: false },
-    scene: { time: '', world: '', location: '' },
+    scene: { ...EMPTY_SCENE },
     greeting: '',
     personaId: null,
   };
@@ -85,7 +92,6 @@ function newConfig() {
   renderCastBar();
   renderBlocks(); renderEntries(); renderVars();
   renderPersona();
-  renderLength();
   $('msgList').innerHTML = '';
   $('chatTitle').textContent = '新作品';
   if ($('cfgName')) $('cfgName').value = state.cfg.name;
@@ -97,10 +103,11 @@ function selectConfig(id) {
   state.configId = id;
   state.cfg = {
     ...cfg,
-    memory: { enabled: false, summary: '', threshold: 20, keepRecent: 8, shortTerm: [], longTerm: [], ...(cfg.memory || {}) },
+    memory: normalizeMemory({ enabled: false, summary: '', markdown: '', threshold: 20, keepRecent: 8, shortTerm: [], longTerm: [], ...(cfg.memory || {}) }),
     choices: { enabled: false, ...(cfg.choices || {}) },
-    responseFormat: { enabled: false, showReview: false, ...(cfg.responseFormat || {}) },
-    scene: { time: '', world: '', location: '', ...(cfg.scene || {}) },
+    // 旧作品没有该字段时，默认恢复结构化剧情模板；明确关闭的作品仍保持关闭。
+    responseFormat: { enabled: cfg.responseFormat?.enabled ?? true, showReview: false, ...(cfg.responseFormat || {}) },
+    scene: { ...EMPTY_SCENE, ...(cfg.scene || {}) },
   };
   // 兼容已保存作品中的旧版格式指令，不改聊天历史、开场白或人物正文。
   for (const block of state.cfg.blocks || []) {
@@ -111,10 +118,9 @@ function selectConfig(id) {
   // 身份按作品绑定；没有绑定时保持空，不继承上一个作品的身份
   state.personaId = cfg.personaId || null;
   // 恢复该作品上次激活的角色
-  const lastKey = 'sil.lastcard.' + id;
-  const savedCardId = localStorage.getItem(lastKey);
+  const savedCardId = store.loadLastCard(id);
   state.cardId = savedCardId && store.loadCard(savedCardId) ? savedCardId : null;
-  state.memoryBusy = false;
+  state.contextVersion += 1;
   state.messages = store.loadChat(id, state.cardId);
   store.setCurrentId(id);
   $('chatTitle').textContent = cfg.name;
@@ -122,22 +128,38 @@ function selectConfig(id) {
   renderConfigList();
   renderCastBar();
   renderBlocks(); renderEntries(); renderVars(); renderPersona();
-  renderLength();
   renderChat();
 }
 
 function persist() {
-  store.saveConfig(state.configId, state.cfg);
-  store.saveChat(state.configId, state.messages, state.cardId);
-  if (state.cardId) localStorage.setItem('sil.lastcard.' + state.configId, state.cardId);
+  try {
+    store.saveConfig(state.configId, state.cfg);
+    store.saveChat(state.configId, state.messages, state.cardId);
+    if (state.cardId) store.setLastCard(state.configId, state.cardId);
+    const status = $('saveStatus');
+    if (status) { status.textContent = ''; status.className = 'tb-stat'; }
+    return true;
+  } catch (error) {
+    const status = $('saveStatus');
+    if (status) {
+      status.textContent = error.message;
+      status.className = 'tb-stat bad';
+    }
+    return false;
+  }
+}
+
+function persistConversation(context) {
+  store.saveConfig(context.configId, context.cfg);
+  store.saveChat(context.configId, context.messages, context.cardId);
+  if (context.cardId) store.setLastCard(context.configId, context.cardId);
 }
 
 function applyCardToConfig(blocks) {
   const names = new Set(blocks.map((b) => b.name));
-  const kept = state.cfg.blocks.filter((b) => !names.has(b.name));
+  const kept = state.cfg.blocks.filter((b) => b.name !== '篇幅要求' && !names.has(b.name));
   state.cfg.blocks = [...kept, ...blocks.map((b) => makeBlock(b))];
   persist();
-  renderLength();
 }
 
 function renderConfigList() {
@@ -193,6 +215,7 @@ function cardAvatarOf(card) {
 
 function switchCast(cardId) {
   if (cardId === state.cardId) return;
+  state.contextVersion += 1;
   state.cardId = cardId;
   state.messages = store.loadChat(state.configId, cardId);
   persist();
@@ -422,82 +445,8 @@ async function checkHealth() {
 }
 
 /* ============ 生成参数 ============ */
-
-/** 作品可覆盖 max_tokens（篇幅档位应用时写入），否则用默认值 */
 function genOpts() {
   return generationOptions(state.cfg);
-}
-
-/* ============ 篇幅控制 ============ */
-
-let currentLenKey = 'epic';
-
-function renderLength(restore = true) {
-  const box = $('lenPresets');
-  if (!box) return;
-  const saved = getLengthSettings(state.cfg);
-  if (restore) currentLenKey = saved.key;
-
-  box.innerHTML = LENGTH_PRESETS.map((p) => {
-    const cap = SUGGESTED_TOKENS[p.key];
-    return `<button class="len-card ${p.key === currentLenKey ? 'on' : ''}" data-k="${p.key}">
-      <span class="lc-label">${p.label}</span>
-      <span class="lc-hint">${p.hint}</span>
-      <span class="lc-cap">正文预算 ${cap} tokens</span>
-    </button>`;
-  }).join('');
-
-  box.querySelectorAll('.len-card').forEach((el) => {
-    el.onclick = () => {
-      if (currentLenKey === el.dataset.k) return;
-      currentLenKey = el.dataset.k;
-      renderLength(false);
-    };
-  });
-
-  $('lenPrompt').value = restore ? saved.prompt : getPrompt(currentLenKey);
-  $('lenPrompt').oninput = updateLenStat;
-  updateLenStat();
-
-  $('lenApply') && ($('lenApply').onclick = () => {
-    try {
-      applyLengthSettings(state.cfg, currentLenKey, $('lenPrompt').value);
-    } catch (err) {
-      $('lenStat').textContent = err.message;
-      $('lenStat').className = 'len-stat';
-      return;
-    }
-    persist();
-    renderBlocks();
-    renderLength();
-    previewPrompt();
-  });
-
-  $('lenCopy') && ($('lenCopy').onclick = async () => {
-    try {
-      await navigator.clipboard.writeText($('lenPrompt').value);
-      $('lenStat').textContent = '已复制到剪贴板';
-      $('lenStat').className = 'len-stat ok';
-    } catch {
-      $('lenStat').textContent = '复制失败，请选中提示词后手动复制。';
-      $('lenStat').className = 'len-stat';
-    }
-  });
-}
-
-function updateLenStat() {
-  const s = $('lenStat');
-  if (!s) return;
-  const p = LENGTH_PRESETS.find((x) => x.key === currentLenKey);
-  const saved = getLengthSettings(state.cfg);
-  const applied = saved.applied && saved.enabled && saved.key === currentLenKey
-    && saved.prompt.trim() === $('lenPrompt').value.trim();
-  const budget = generationOptions({ ...state.cfg,
-    length: null,
-    vars: { ...state.cfg.vars, maxTokens: SUGGESTED_TOKENS[currentLenKey] },
-  }).max_tokens;
-  s.className = 'len-stat' + (applied ? ' ok' : '');
-  s.textContent = `${applied ? '已应用' : '待应用'}：${p?.label}档 · 正文预算 ${SUGGESTED_TOKENS[currentLenKey]} tokens · 含状态/选项的输出上限 ${budget} tokens。字数是目标，实际长度由模型决定。`;
 }
 
 /* ============ 基础设置：设定块 ============ */
@@ -554,6 +503,7 @@ function renderEntries() {
       <div class="ec-head">
         <label class="chk"><input class="ec-on" type="checkbox" ${e.enabled ? 'checked' : ''}>启用</label>
         <label class="chk"><input class="ec-const" type="checkbox" ${e.constant ? 'checked' : ''}>常驻</label>
+        <select class="ec-type" title="设定类型">${Object.entries(ENTRY_TYPE_LABELS).map(([key, label]) => `<option value="${key}" ${(e.type || 'general') === key ? 'selected' : ''}>${label}</option>`).join('')}</select>
         <input class="ec-cat" value="${escapeHtml(e.category || '')}" placeholder="分类">
         <input class="ec-order" type="number" value="${e.order || 100}" title="数字越小越靠前">
         <button class="ec-del" title="删除">×</button>
@@ -578,6 +528,11 @@ function renderEntries() {
         </select>
       </div>
       <textarea class="ec-keys" rows="1" placeholder="触发关键词，逗号分隔（支持 /正则/）">${escapeHtml((e.keys || []).join(', '))}</textarea>
+      <details class="ec-conditions"><summary>高级触发条件</summary><div class="ec-condition-grid">
+        <label class="mini">满足任一条件词<textarea class="ec-requires" rows="1" placeholder="例如：发现旧信，关系转为信任">${escapeHtml((e.requires || []).join(', '))}</textarea></label>
+        <label class="mini">排除任一条件词<textarea class="ec-excludes" rows="1" placeholder="例如：已离开山城">${escapeHtml((e.excludes || []).join(', '))}</textarea></label>
+        <label class="mini">关系阶段<textarea class="ec-stage" rows="1" placeholder="留空表示不限阶段">${escapeHtml(e.relationshipStage || '')}</textarea></label>
+      </div><small>条件词会检查当前输入、场景、角色关系和局势；关系阶段需匹配当前角色状态。</small></details>
       <textarea class="ec-body" rows="4" placeholder="内容—— 必须是完整独立的陈述，模型只看得到这一段">${escapeHtml(e.content)}</textarea>
     </div>`).join('');
 
@@ -587,6 +542,7 @@ function renderEntries() {
 
     card.querySelector('.ec-on').onchange = (e) => { find().enabled = e.target.checked; persist(); renderEntries(); };
     card.querySelector('.ec-const').onchange = (e) => { find().constant = e.target.checked; persist(); };
+    card.querySelector('.ec-type').onchange = (e) => { find().type = e.target.value; persist(); };
     card.querySelector('.ec-cat').oninput = (e) => { find().category = e.target.value; persist(); };
     card.querySelector('.ec-order').onchange = (e) => { find().order = parseInt(e.target.value) || 100; persist(); };
     card.querySelector('.ec-scan').onchange = (e) => { find().scan = e.target.value; persist(); };
@@ -596,6 +552,13 @@ function renderEntries() {
       find().keys = e.target.value.split(/[,，\n]/).map((s) => s.trim()).filter(Boolean);
       persist();
     };
+    for (const [selector, key] of [['.ec-requires', 'requires'], ['.ec-excludes', 'excludes']]) {
+      card.querySelector(selector).oninput = (event) => {
+        find()[key] = event.target.value.split(/[,，\n]/).map((value) => value.trim()).filter(Boolean);
+        persist();
+      };
+    }
+    card.querySelector('.ec-stage').oninput = (event) => { find().relationshipStage = event.target.value.trim(); persist(); };
     card.querySelector('.ec-body').oninput = (e) => { find().content = e.target.value; persist(); };
     card.querySelector('.ec-del').onclick = () => {
       state.cfg.entries = state.cfg.entries.filter((x) => x.id !== id);
@@ -662,54 +625,63 @@ function applyStateFromReply(raw) {
   return parsed;
 }
 
-/** 应用结构化回复中的状态、场景和剧情记忆，并保存到当前作品。 */
-function applyStructuredReply(raw) {
+/** Apply structured data to its owning story, even if the visible story changes mid-stream. */
+function applyStructuredReplyToConfig(raw, cfg) {
   const parsed = parseStructuredReply(raw);
   let changed = false;
 
   if (parsed.state) {
-    state.cfg.vars = state.cfg.vars || {};
-    state.cfg.vars.values = { ...(state.cfg.vars.values || {}), ...parsed.state };
+    cfg.vars = cfg.vars || {};
+    cfg.vars.values = { ...(cfg.vars.values || {}), ...parsed.state };
     changed = true;
   }
 
   if (parsed.scene && typeof parsed.scene === 'object') {
-    const next = { ...(state.cfg.scene || {}) };
-    for (const key of ['time', 'world', 'location']) {
-      if (parsed.scene[key] != null && String(parsed.scene[key]).trim()) {
-        next[key] = String(parsed.scene[key]).trim();
-      }
+    const next = { ...(cfg.scene || {}) };
+    for (const key of ['time', 'world', 'location', 'plot', 'weather', 'atmosphere', 'lighting', 'goal', 'conflict']) {
+      if (Object.hasOwn(parsed.scene, key)) next[key] = String(parsed.scene[key] ?? '').trim();
     }
-    state.cfg.scene = next;
+    if (Object.hasOwn(parsed.scene, 'tension')) next.tension = parsed.scene.tension ?? '';
+    for (const key of ['sounds', 'scents', 'participants', 'objects']) {
+      if (Object.hasOwn(parsed.scene, key) && Array.isArray(parsed.scene[key])) next[key] = parsed.scene[key];
+    }
+    cfg.scene = next;
+    changed = true;
+  }
+
+  if (parsed.player) { cfg.playerState = parsed.player; changed = true; }
+  if (parsed.characters) { cfg.characterStates = parsed.characters; changed = true; }
+  if (parsed.situation) { cfg.situation = parsed.situation; changed = true; }
+
+  if (parsed.changes && typeof parsed.changes === 'object') {
+    cfg.lastChanges = parsed.changes;
     changed = true;
   }
 
   if (parsed.memory && typeof parsed.memory === 'object') {
-    const memory = state.cfg.memory || {};
-    const add = (old, incoming, limit) => [...new Set([
-      ...(Array.isArray(old) ? old : []),
-      ...(Array.isArray(incoming) ? incoming.filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim()) : []),
-    ])].slice(-limit);
-    state.cfg.memory = {
-      ...memory,
-      shortTerm: add(memory.shortTerm, parsed.memory.shortTerm, 20),
-      longTerm: add(memory.longTerm, parsed.memory.longTerm, 50),
-    };
+    cfg.memory = mergeMemory(cfg.memory || {}, parsed.memory);
     changed = true;
   }
 
-  if (changed) {
+  return { parsed, changed };
+}
+
+/** Apply a reply to the currently selected story and refresh its panels. */
+function applyStructuredReply(raw) {
+  const result = applyStructuredReplyToConfig(raw, state.cfg);
+  if (result.changed) {
     persist();
     renderStatePanel();
     renderMemory();
   }
-  return parsed;
+  return result.parsed;
 }
 
 function renderMemory() {
   const m = state.cfg.memory || {};
   if ($('memoryOn')) $('memoryOn').checked = !!m.enabled;
   if ($('memorySummary')) $('memorySummary').value = m.summary || '';
+  if ($('memoryMarkdown')) $('memoryMarkdown').value = m.markdown || memoryToMarkdown(m);
   if ($('memoryThreshold')) $('memoryThreshold').value = m.threshold || 20;
   if ($('memoryKeep')) $('memoryKeep').value = m.keepRecent || 8;
   if ($('memoryPanel')) $('memoryPanel').style.display = m.enabled ? 'block' : 'none';
@@ -724,34 +696,39 @@ function setMemoryStatus(text, kind = '') {
 
 async function summarizeMemory(force = false) {
   if (state.memoryBusy) return;
-  const m = state.cfg.memory || {};
+  const context = { version: state.contextVersion, configId: state.configId, cardId: state.cardId, cfg: state.cfg, messages: state.messages };
+  const m = context.cfg.memory || {};
   if (!m.enabled && !force) return;
   const keep = Math.max(2, Math.min(30, Number(m.keepRecent) || 8));
-  const old = state.messages.slice(0, -keep);
+  const old = context.messages.slice(0, -keep);
   if (old.length < 2) {
-    setMemoryStatus('对话还不够长，暂时无需摘要。');
+    if (context.version === state.contextVersion) setMemoryStatus('对话还不够长，暂时无需摘要。');
     return;
   }
 
   state.memoryBusy = true;
-  setMemoryStatus('正在整理较早对话…', 'busy');
+  if (context.version === state.contextVersion) setMemoryStatus('正在整理较早对话…', 'busy');
   const transcript = old.map((x) => `${x.role === 'user' ? '用户' : '角色'}：${x.content}`).join('\n');
-  const previous = m.summary ? `已有摘要：\n${m.summary}\n\n` : '';
+  const previous = m.markdown ? `已有 Markdown 记忆：\n${m.markdown}\n\n` : (m.summary ? `已有摘要：\n${m.summary}\n\n` : '');
   try {
     const result = await llm.chat([
-      { role: 'system', content: '你是角色扮演对话的记忆整理器。保留人物关系、已经发生的事实、承诺、未解决的线索和当前情绪。只输出简洁的中文摘要，不要输出标题、分析或 JSON。' },
-      { role: 'user', content: `${previous}请把下面的较早对话整理成可供后续模型延续剧情的摘要：\n${transcript}` },
+      { role: 'system', content: '你是角色扮演对话的记忆整理器。保留人物关系、已经发生的事实、承诺、未解决的线索和当前情绪。只输出 Markdown，不要输出思维链、解释或 JSON。必须使用以下标题：# 剧情记忆、## 对话摘要、## 长期记忆、## 短期记忆；事实使用无序列表。' },
+      { role: 'user', content: `${previous}请把下面的较早对话整理成可供后续模型延续剧情的 Markdown 记忆档案。合并重复事实，删除已经被明确推翻的旧状态，但不要凭空补充：\n${transcript}` },
     ], { temperature: 0.25, max_tokens: 500 });
-    const summary = (result.content || '').trim();
-    if (!summary) throw new Error('模型没有返回摘要');
-    state.cfg.memory = { ...m, summary, enabled: true, keepRecent: keep };
-    state.messages = state.messages.slice(-keep);
-    persist();
-    renderMemory();
-    renderChat();
-    setMemoryStatus(`已整理 ${old.length} 条旧消息，保留最近 ${keep} 条。`, 'ok');
+    const markdown = (result.content || '').trim();
+    if (!markdown) throw new Error('模型没有返回摘要');
+    const parsed = parseMemoryMarkdown(markdown);
+    context.cfg.memory = normalizeMemory({ ...m, ...parsed, summary: parsed.summary || m.summary, markdown, enabled: true, keepRecent: keep });
+    context.messages = context.messages.slice(-keep);
+    persistConversation(context);
+    if (context.version === state.contextVersion) {
+      state.messages = context.messages;
+      renderMemory();
+      renderChat();
+      setMemoryStatus(`已整理 ${old.length} 条旧消息，保留最近 ${keep} 条。`, 'ok');
+    }
   } catch (err) {
-    setMemoryStatus('摘要失败：' + err.message, 'bad');
+    if (context.version === state.contextVersion) setMemoryStatus('摘要失败：' + err.message, 'bad');
     console.error(err);
   } finally {
     state.memoryBusy = false;
@@ -817,6 +794,7 @@ function bubbleFor(m) {
   const wrap = document.createElement('div');
   wrap.className = 'bubble ai-bubble';
   const structured = parseStructuredReply(m.content || '');
+  appendSceneStrip(wrap, structured.scene);
   for (const seg of parseReply(structured.text)) {
     if (seg.type === 'text') {
       const d = document.createElement('div');
@@ -830,15 +808,39 @@ function bubbleFor(m) {
       wrap.appendChild(holder);
     }
   }
-  if (structured.scene && typeof structured.scene === 'object') {
-    const scene = document.createElement('div');
-    scene.className = 'scene-strip';
-    const sceneItems = [
-      ['time', '时间'], ['world', '世界'], ['location', '场所'],
-    ].filter(([key]) => structured.scene[key]);
-    scene.innerHTML = sceneItems.map(([key, label]) =>
-      `<span><b>${label}</b>${escapeHtml(String(structured.scene[key]))}</span>`).join('');
-    if (sceneItems.length) wrap.appendChild(scene);
+  if (structured.player && typeof structured.player === 'object') {
+    const persona = getPersona();
+    const rows = [
+      ['姓名', persona?.name], ['身份', structured.player.status],
+      ...Object.entries(structured.player.values || {}).map(([key, value]) => [key, displaySceneValue(value)]),
+    ].filter(([, value]) => value != null && String(value).trim());
+    appendStructuredPanel(wrap, '玩家状态', rows, 'reply-player');
+  }
+  if (Array.isArray(structured.characters) && structured.characters.length) {
+    const rows = structured.characters.map((item) => [item.name,
+      [item.mood, item.relationship, item.goal, item.status].filter(Boolean).join(' · ')]);
+    appendStructuredPanel(wrap, '角色状态', rows, 'reply-characters');
+  }
+  if (structured.situation && typeof structured.situation === 'object') {
+    const rows = [
+      ['当前风险', structured.situation.risks],
+      ['待解决事项', structured.situation.openThreads],
+    ].filter(([, value]) => Array.isArray(value) ? value.length : !!value);
+    appendStructuredPanel(wrap, '场景与风险', rows, 'reply-situation');
+  }
+  if (structured.changes && typeof structured.changes === 'object') {
+    const changes = document.createElement('details');
+    changes.className = 'reply-changes';
+    const value = structured.changes;
+    const rows = [
+      ['summary', '本轮概况'], ['time', '时间'], ['location', '地点'], ['discoveries', '新发现'], ['relationships', '关系变化'],
+      ['state', '状态变化'], ['events', '本轮事件'], ['goals', '目标变化'],
+    ].filter(([key]) => value[key] != null && String(value[key]).trim())
+      .map(([key, label]) => `<div><b>${label}</b>${escapeHtml(displaySceneValue(value[key]))}</div>`);
+    if (rows.length) {
+      changes.innerHTML = `<summary>本轮变化</summary><div class="changes-content">${rows.join('')}</div>`;
+      wrap.appendChild(changes);
+    }
   }
   if (structured.memory && typeof structured.memory === 'object') {
     const memory = document.createElement('details');
@@ -860,12 +862,16 @@ function bubbleFor(m) {
   if (structured.choices.length) {
     const choices = document.createElement('div');
     choices.className = 'reply-choices';
-    choices.innerHTML = '<span class="choices-label">可以选择：</span>' + structured.choices.map((choice) =>
-      `<button class="choice-btn" type="button">${escapeHtml(choice)}</button>`).join('');
+    choices.innerHTML = '<span class="choices-label">可以选择：</span>' + structured.choices.map((choice) => {
+      const item = typeof choice === 'string' ? { text: choice } : choice;
+      const meta = [item.type, item.intent, item.risk && `风险：${item.risk}`].filter(Boolean).join(' · ');
+      return `<button class="choice-btn" type="button"><span>${escapeHtml(item.text)}</span>${meta ? `<small>${escapeHtml(meta)}</small>` : ''}</button>`;
+    }).join('');
     choices.querySelectorAll('.choice-btn').forEach((button, index) => {
       button.onclick = () => {
         const input = $('chatInput');
-        input.value = structured.choices[index];
+        const item = structured.choices[index];
+        input.value = typeof item === 'string' ? item : item.text;
         input.focus();
       };
     });
@@ -894,6 +900,55 @@ function bubbleFor(m) {
   };
 
   return div;
+}
+
+function appendSceneStrip(wrap, sceneData) {
+  if (!sceneData || typeof sceneData !== 'object') return;
+  const sceneItems = [
+    ['time', '时间'], ['world', '世界'], ['location', '场所'], ['plot', '情节'], ['weather', '天气'],
+    ['atmosphere', '氛围'], ['lighting', '光线'], ['sounds', '声音'], ['scents', '气味'],
+    ['goal', '目标'], ['conflict', '冲突'], ['tension', '紧张度'],
+  ].filter(([key]) => sceneData[key] != null && String(sceneData[key]).trim());
+  const rows = sceneItems.map(([key, label]) =>
+    `<span><b>${label}</b>${escapeHtml(displaySceneValue(sceneData[key]))}</span>`);
+  if (Array.isArray(sceneData.participants) && sceneData.participants.length) {
+    rows.push(`<div class="scene-section"><b>在场人物</b>${sceneData.participants.map((person) =>
+      `<span>${escapeHtml(displayPerson(person))}</span>`).join('')}</div>`);
+  }
+  if (Array.isArray(sceneData.objects) && sceneData.objects.length) {
+    rows.push(`<div class="scene-section"><b>可交互物品</b>${sceneData.objects.map((item) =>
+      `<span>${escapeHtml(displayObject(item))}</span>`).join('')}</div>`);
+  }
+  if (!rows.length) return;
+  const strip = document.createElement('div');
+  strip.className = 'scene-strip';
+  strip.innerHTML = `<div class="scene-title">场景信息</div>${rows.join('')}`;
+  wrap.appendChild(strip);
+}
+
+function appendStructuredPanel(wrap, title, rows, className) {
+  if (!rows.length) return;
+  const panel = document.createElement('details');
+  panel.className = `reply-status ${className}`;
+  panel.innerHTML = `<summary>${escapeHtml(title)}</summary><div class="status-content">${rows.map(([label, value]) =>
+    `<div><b>${escapeHtml(label)}</b><span>${escapeHtml(displaySceneValue(value))}</span></div>`).join('')}</div>`;
+  wrap.appendChild(panel);
+}
+
+function displaySceneValue(value) {
+  if (Array.isArray(value)) return value.map((item) => String(item)).join('、');
+  if (value && typeof value === 'object') return JSON.stringify(value);
+  return String(value ?? '');
+}
+
+function displayPerson(value) {
+  const item = value && typeof value === 'object' ? value : { name: value };
+  return [item.name, item.position, item.emotion, item.action].filter(Boolean).join(' · ');
+}
+
+function displayObject(value) {
+  const item = value && typeof value === 'object' ? value : { name: value };
+  return [item.name, item.location, item.status].filter(Boolean).join(' · ');
 }
 
 function scrollDown() {
@@ -925,10 +980,149 @@ function buildPrompt(userInput) {
     choices: state.cfg.choices,
     responseFormat: state.cfg.responseFormat,
     scene: state.cfg.scene,
+    playerState: state.cfg.playerState,
+    characters: state.cfg.characterStates,
+    situation: state.cfg.situation,
     persona: persona ? personaToBlock(persona) : '',
     charName: card ? (card.name || '') : '',
     userName: persona ? (persona.name || '') : '',
   });
+}
+
+function extractStructuredReplyTags(raw) {
+  return serializeStructuredReply(parseStructuredReply(raw));
+}
+
+function compactReplyText(text) {
+  return String(text || '').replace(/\s/g, '');
+}
+
+function originalIndexAfterCompactChars(text, count) {
+  if (count <= 0) return 0;
+  let seen = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    if (/\s/.test(text[index])) continue;
+    seen += 1;
+    if (seen >= count) return index + 1;
+  }
+  return text.length;
+}
+
+/** 小模型有时会把续写请求当成重新生成；丢弃重复的开头，避免正文无限膨胀。 */
+function removeRepeatedContinuation(previousText, continuationText) {
+  const previous = String(previousText || '').trim();
+  const continuation = String(continuationText || '').trim();
+  const previousCompact = compactReplyText(previous);
+  const continuationCompact = compactReplyText(continuation);
+  const probeLength = 120;
+  if (continuationCompact.length < probeLength || !previousCompact.startsWith(continuationCompact.slice(0, probeLength))) {
+    return continuation;
+  }
+
+  let common = 0;
+  const limit = Math.min(previousCompact.length, continuationCompact.length);
+  while (common < limit && previousCompact[common] === continuationCompact[common]) common += 1;
+  if (common < probeLength) return continuation;
+  return continuation.slice(originalIndexAfterCompactChars(continuation, common)).trim();
+}
+
+function normalizeRepeatParagraph(text) {
+  return String(text || '').replace(/\s/g, '').replace(/[，。！？、；：“”‘’（）()《》<>「」『』,.!?;:'"\-—_]/g, '');
+}
+
+function repeatUnits(text) {
+  const source = String(text || '').trim();
+  if (!source) return { units: [], separator: '\n\n' };
+  const paragraphs = source.split(/\n\s*\n/).map((item) => item.trim()).filter(Boolean);
+  if (paragraphs.length > 1) return { units: paragraphs, separator: '\n\n' };
+  const lines = source.split(/\n+/).map((item) => item.trim()).filter(Boolean);
+  if (lines.length > 1) return { units: lines, separator: '\n' };
+  return { units: [source], separator: '' };
+}
+
+/** 删除同一回复内重复的段落循环，例如 A/B/C/A/B/C。 */
+function collapseRepeatedParagraphs(text) {
+  const { units: paragraphs, separator } = repeatUnits(text);
+  if (paragraphs.length < 2) return String(text || '').trim();
+  for (let pass = 0; pass < 4; pass += 1) {
+    let removed = false;
+    for (let cycle = Math.min(6, Math.floor(paragraphs.length / 2)); cycle >= 1; cycle -= 1) {
+      for (let start = 0; start + cycle * 2 <= paragraphs.length; start += 1) {
+        const left = paragraphs.slice(start, start + cycle);
+        const right = paragraphs.slice(start + cycle, start + cycle * 2);
+        const total = left.reduce((sum, part) => sum + normalizeRepeatParagraph(part).length, 0);
+        if (total < 120 || left.some((part) => normalizeRepeatParagraph(part).length < 20)) continue;
+        if (left.length && left.every((part, index) => normalizeRepeatParagraph(part) === normalizeRepeatParagraph(right[index]))) {
+          paragraphs.splice(start + cycle, cycle);
+          removed = true;
+          break;
+        }
+      }
+      if (removed) break;
+    }
+    if (!removed) {
+      // 模型常在完整循环后又吐出循环开头的一两个段落（A/B/C/A/B/C/A）。
+      // 只在同一回复从开头开始至少重复两轮时截断，避免误伤正常的回指。
+      for (let cycle = Math.min(6, paragraphs.length - 1); cycle >= 1; cycle -= 1) {
+        const base = paragraphs.slice(0, cycle);
+        const baseLength = base.reduce((sum, part) => sum + normalizeRepeatParagraph(part).length, 0);
+        if (baseLength < 120 || base.some((part) => normalizeRepeatParagraph(part).length < 20)) continue;
+        let cursor = cycle;
+        let repeats = 1;
+        while (cursor + cycle <= paragraphs.length
+          && base.every((part, index) => normalizeRepeatParagraph(part) === normalizeRepeatParagraph(paragraphs[cursor + index]))) {
+          cursor += cycle;
+          repeats += 1;
+        }
+        let partial = 0;
+        while (cursor + partial < paragraphs.length && partial < cycle
+          && normalizeRepeatParagraph(paragraphs[cursor + partial]) === normalizeRepeatParagraph(base[partial])) partial += 1;
+        if (repeats >= 2 && (cursor < paragraphs.length || partial)) {
+          paragraphs.splice(cursor);
+          removed = true;
+          break;
+        }
+      }
+    }
+    if (removed) {
+      // 上面的成对删除可能留下循环的残尾（A/B/C/A），一并去掉。
+      for (let cycle = Math.min(6, paragraphs.length - 1); cycle >= 1; cycle -= 1) {
+        const base = paragraphs.slice(0, cycle);
+        const baseLength = base.reduce((sum, part) => sum + normalizeRepeatParagraph(part).length, 0);
+        if (baseLength < 120 || base.some((part) => normalizeRepeatParagraph(part).length < 20)) continue;
+        let matches = true;
+        for (let index = cycle; index < paragraphs.length; index += 1) {
+          if (normalizeRepeatParagraph(paragraphs[index]) !== normalizeRepeatParagraph(base[(index - cycle) % cycle])) {
+            matches = false;
+            break;
+          }
+        }
+        if (matches && paragraphs.length > cycle) {
+          paragraphs.splice(cycle);
+          break;
+        }
+      }
+    }
+    if (!removed) break;
+  }
+  return paragraphs.join(separator || '\n\n');
+}
+
+function collapseReplyRepetitions(raw) {
+  const parsed = parseStructuredReply(raw);
+  const body = collapseRepeatedParagraphs(parsed.text);
+  const tags = extractStructuredReplyTags(raw);
+  return [body, ...tags].filter(Boolean).join('\n\n');
+}
+
+function mergeReplyContinuation(previous, continuation) {
+  const before = parseStructuredReply(previous);
+  const next = parseStructuredReply(continuation);
+  const continuationText = removeRepeatedContinuation(before.text, collapseRepeatedParagraphs(next.text));
+  const body = [before.text, continuationText].map((text) => text.trim()).filter(Boolean).join('\n\n');
+  const tags = extractStructuredReplyTags(continuation);
+  const fallbackTags = extractStructuredReplyTags(previous);
+  return [body, ...(tags.length ? tags : fallbackTags)].filter(Boolean).join('\n\n');
 }
 
 async function send() {
@@ -939,7 +1133,8 @@ async function send() {
 
   const { messages, stats } = buildPrompt(text);
 
-  state.messages.push({ role: 'user', content: text });
+  const context = { version: state.contextVersion, configId: state.configId, cardId: state.cardId, cfg: state.cfg, messages: state.messages };
+  context.messages.push({ role: 'user', content: text });
   input.value = '';
   persist();
   renderChat();
@@ -959,24 +1154,59 @@ async function send() {
   let full = '';
   try {
     await llm.stream(messages, (delta, acc) => {
-      full = acc;
-      bubbleEl.innerHTML = formatText(escapeHtml(parseStructuredReply(acc).text));
-      scrollDown();
+      full = collapseReplyRepetitions(acc);
+      if (context.version === state.contextVersion) {
+        bubbleEl.innerHTML = formatText(escapeHtml(parseStructuredReply(full).text));
+        scrollDown();
+      }
     }, genOpts());
 
+    // Continue short generations into the fixed v3 body range.
+    const target = getBodyTarget(context.cfg);
+    let continuationCount = 0;
+    while (target && continuationCount < 3) {
+      const parsed = parseStructuredReply(full);
+      const currentLength = getBodyLength(parsed.text);
+      if (currentLength >= target) break;
+
+      const continuationInput = `【正文补写】当前正文为${currentLength}字，目标范围为1000-2000字，目标约${TARGET_BODY_CHARS}字。请从上一段末尾继续，不重写或重复前文；补充角色反应、环境、感官、心理、对白和事件推进，并在达到目标范围后输出最终结构化数据。总正文不要超过${MAX_BODY_CHARS}字。玩家描写仍最多占正文10%，不得替玩家新增关键决定、意图、立场、目标、同意或核心行动。`;
+      const continuationMessages = [
+        ...messages,
+        { role: 'assistant', content: `【上一段正文末尾】\n${parsed.text.slice(-1600)}` },
+        { role: 'user', content: continuationInput },
+      ];
+      let continuation = '';
+      await llm.stream(continuationMessages, (delta, acc) => {
+        continuation = collapseReplyRepetitions(acc);
+        const merged = mergeReplyContinuation(full, acc);
+        if (context.version === state.contextVersion) {
+          bubbleEl.innerHTML = formatText(escapeHtml(parseStructuredReply(merged).text));
+          scrollDown();
+        }
+      }, genOpts());
+      const merged = mergeReplyContinuation(full, continuation);
+      if (getBodyLength(parseStructuredReply(merged).text) <= currentLength) break;
+      full = merged;
+      continuationCount += 1;
+    }
+
     const dt = (performance.now() - t0) / 1000;
-    applyStructuredReply(full);
-    state.messages.push({
+    applyStructuredReplyToConfig(full, context.cfg);
+    context.messages.push({
       role: 'assistant',
       content: full,
       stats: { tps: dt > 0 ? (full.length / 1.5) / dt : 0, tokens: Math.round(full.length / 1.5) },
     });
-    persist();
-    renderChat();
-    renderCastBar();
-    maybeAutoSummarize();
+    persistConversation(context);
+    if (context.version === state.contextVersion) {
+      renderStatePanel();
+      renderMemory();
+      renderChat();
+      renderCastBar();
+      maybeAutoSummarize();
+    }
   } catch (err) {
-    bubbleEl.innerHTML = `<div class="err">出错了：${escapeHtml(err.message)}</div>`;
+    if (context.version === state.contextVersion) bubbleEl.innerHTML = `<div class="err">出错了：${escapeHtml(err.message)}</div>`;
     console.error(err);
   } finally {
     state.busy = false;
@@ -1043,7 +1273,6 @@ function bindEvents() {
       document.querySelectorAll('.tabpane').forEach((p) => (p.style.display = 'none'));
       $('pane-' + state.tab).style.display = 'block';
       if (state.tab === 'debug') previewPrompt();
-      if (state.tab === 'length') renderLength();
     };
   });
 
@@ -1069,14 +1298,19 @@ function bindEvents() {
     state.cfg.vars.historyLimit = parseInt(e.target.value) || 20; persist();
   };
   $('memoryOn').onchange = (e) => {
-    state.cfg.memory = state.cfg.memory || { summary: '', threshold: 20, keepRecent: 8 };
+    state.cfg.memory = normalizeMemory({ summary: '', threshold: 20, keepRecent: 8, ...(state.cfg.memory || {}) });
     state.cfg.memory.enabled = e.target.checked;
     persist(); renderVars(); previewPrompt();
   };
-  $('memorySummary').oninput = (e) => {
-    state.cfg.memory = state.cfg.memory || {};
-    state.cfg.memory.summary = e.target.value;
-    persist();
+  if ($('memoryMarkdown')) $('memoryMarkdown').oninput = (e) => {
+    const parsed = parseMemoryMarkdown(e.target.value);
+    state.cfg.memory = normalizeMemory({ ...(state.cfg.memory || {}), ...parsed, markdown: e.target.value });
+    persist(); previewPrompt();
+  };
+  // 旧页面缓存仍可能保留摘要输入框，继续同步它，避免升级过程中丢失手工内容。
+  if ($('memorySummary')) $('memorySummary').oninput = (e) => {
+    state.cfg.memory = normalizeMemory({ ...(state.cfg.memory || {}), summary: e.target.value });
+    persist(); previewPrompt();
   };
   $('memoryThreshold').onchange = (e) => {
     state.cfg.memory = state.cfg.memory || {};
@@ -1124,6 +1358,32 @@ function bindEvents() {
     a.download = `${state.cfg.name || 'config'}.json`;
     a.click();
   };
+  $('backupExportBtn').onclick = () => {
+    const blob = new Blob([store.exportWorkspaceBackup()], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `StoryRealm-完整备份-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+  };
+  $('backupImportBtn').onclick = () => $('backupFile').click();
+  $('backupFile').onchange = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const id = store.importWorkspaceBackup(reader.result);
+        const nextId = id && store.loadConfig(id) ? id : Object.keys(store.listConfigs())[0];
+        if (nextId) selectConfig(nextId);
+        else newConfig();
+        alert('完整备份已恢复');
+      } catch (error) {
+        alert('备份恢复失败：' + error.message);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
   $('importBtn').onclick = () => $('importFile').click();
   $('importFile').onchange = (e) => {
     const f = e.target.files[0];
@@ -1134,7 +1394,7 @@ function bindEvents() {
         state.cfg = importConfig(reader.result);
         state.messages = [];
         store.saveConfig(state.configId, state.cfg);
-        persist(); renderBlocks(); renderEntries(); renderVars(); renderCastBar(); renderChat(); renderLength();
+        persist(); renderBlocks(); renderEntries(); renderVars(); renderCastBar(); renderChat();
         $('cfgName').value = state.cfg.name;
         $('chatTitle').textContent = state.cfg.name;
         renderConfigList();
@@ -1173,10 +1433,8 @@ window.addEventListener('error', (e) => showFatal(e.message, `${e.filename}:${e.
 window.addEventListener('unhandledrejection', (e) => showFatal('Promise: ' + e.reason));
 
 document.addEventListener('DOMContentLoaded', () => {
-  try {
-    init();
-  } catch (err) {
+  init().catch((err) => {
     showFatal('init 失败: ' + err.message, err.stack);
     console.error(err);
-  }
+  });
 });

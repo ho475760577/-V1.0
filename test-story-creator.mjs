@@ -12,10 +12,23 @@ const fixture = () => ({
   title: '山城来信', premise: '一封旧信让两位旅伴重新调查老街的往事。',
   world: '现代山城，老街即将改造。没有超自然力量。', tone: '慢节奏探索',
   character: { name: '顾岚', gender: 'female', age: '28', tagline: '修复旧书的店主',
-    personality: '谨慎细心', background: '自小在山城长大', build: '体态匀称', voice: '清亮' },
+    personality: '谨慎细心', background: '自小在山城长大', build: '体态匀称', voice: '清亮',
+    shortTermGoal: '确认旧信寄件人', longTermGoal: '保住老街书店', fear: '再次失去家人',
+    need: '学会接受帮助', contradiction: '渴望亲近却习惯回避', boundaries: '不容许伤害店员',
+    behaviorCues: '压力下先整理物品再回答', arc: '逐步学会信任伙伴' },
   persona: { name: '周川', gender: 'male', identity: '回乡的摄影师，与顾岚是旧识', personality: '沉稳' },
-  supportingCharacters: [{ name: '陈伯', identity: '老街邮递员', relationship: '认识顾岚的父亲' }],
-  worldbook: [{ name: '钟楼', keys: ['钟楼', '老钟'], content: '老街的钟楼每逢雨天会停摆。' }],
+  supportingCharacters: [{ name: '陈伯', identity: '老街邮递员', relationship: '认识顾岚的父亲',
+    shortTermGoal: '确认旧信是否寄错', longTermGoal: '守住老邮局', fear: '被街坊视为多管闲事',
+    need: '承认自己也需要帮助', contradiction: '热心却害怕介入', boundaries: '不替当事人做决定',
+    behaviorCues: '遇到压力会反复核对日期', arc: '从旁观者成为主动证人' }],
+  storyMechanics: { timeline: '按线索和选择推进，不按固定轮数跳阶段',
+    relationshipStages: '从旧识试探到重新信任；误解可使关系暂时退回',
+    triggerRules: '找到寄件记录后才触发钟楼调查；若线索不足先出现新阻碍',
+    brakeConditions: '角色明确拒绝时停止当前行动，先处理信任与安全感',
+    consequences: '公开旧信会引发街坊议论，也可能获得新证词',
+    npcAgency: '陈伯会主动核对邮戳，小林可能带来夜班时看到的线索' },
+  worldbook: [{ type: 'event', name: '雨夜钟楼停摆', keys: ['钟楼', '老钟'], requires: ['雨夜'],
+    excludes: ['钟楼已修复'], relationshipStage: '信任', content: '钟楼停摆会暴露暗门；角色可能隐瞒，也可能主动说明。' }],
   scene: { time: '秋日午后', world: '山城', location: '旧书店' },
   opening: '雨水敲着店檐。顾岚放下旧书，抬头说道：“好久不见。”',
 });
@@ -42,8 +55,9 @@ function seed() {
 }
 
 await test('访谈只提取当前步骤以前的公开回答', () => {
-  assert.equal(STORY_STEPS.length, 5);
+  assert.equal(STORY_STEPS.length, 6);
   assert.deepEqual(storyAnswers({ idea: ' 山城 ', world: '现代', character: '店主', secret: '私密' }, 2), { idea: '山城', world: '现代' });
+  assert.deepEqual(storyAnswers({ idea: '山城', dynamics: '慢慢建立信任' }).dynamics, '慢慢建立信任');
   assert.deepEqual(storyAnswers({ idea: { nested: 1 }, world: false }), {});
 });
 await test('AI 追问携带已有回答，排除之后的回答与任意附加字段', async () => {
@@ -70,10 +84,28 @@ await test('草稿白名单过滤旧标识、私人备注及未声明字段', ()
   const f = fixture();
   f.id = 'old'; f.messages = ['旧聊天']; f.character.id = 'old-card'; f.character.avatar = 'private';
   f.persona.note = '私密'; f.persona.id = 'old-persona'; f.scene.extra = '未知';
+  f.storyMechanics.script = '不允许的字段'; f.supportingCharacters[0].id = 'foreign-id';
   const d = normalizeStoryDraft(f);
   for (const key of ['id', 'messages']) assert.ok(!(key in d));
   for (const key of ['id', 'avatar']) assert.ok(!(key in d.character));
   assert.ok(!('note' in d.persona)); assert.ok(!('id' in d.persona)); assert.ok(!('extra' in d.scene));
+  assert.ok(!('script' in d.storyMechanics)); assert.ok(!('id' in d.supportingCharacters[0]));
+});
+await test('富场景字段经过白名单并进入作品配置', () => {
+  const f = fixture();
+  f.scene = {
+    time: '雨夜', world: '山城', location: '旧书店', weather: '小雨', atmosphere: '压抑', lighting: '昏黄',
+    sounds: ['雨声', '钟响'], scents: ['潮湿木头'],
+    participants: [{ name: '顾岚', position: '柜台后', emotion: '警觉', action: '翻账本', secret: '过滤' }],
+    objects: [{ name: '旧信', location: '桌面', status: '未拆封', extra: '过滤' }], goal: '确认来源', conflict: '有人监视', tension: 6,
+    extra: '过滤',
+  };
+  const d = normalizeStoryDraft(f);
+  assert.equal(d.scene.weather, '小雨'); assert.deepEqual(d.scene.sounds, ['雨声', '钟响']);
+  assert.equal(d.scene.participants[0].position, '柜台后'); assert.ok(!('secret' in d.scene.participants[0]));
+  assert.ok(!('extra' in d.scene));
+  const { cfg } = buildStoryBundle(f);
+  assert.equal(cfg.scene.objects[0].status, '未拆封'); assert.equal(cfg.scene.tension, 6);
 });
 await test('中文性别及数字年龄兼容，不按姓名推断性别', () => {
   const f = fixture(); f.character.gender = '女'; f.character.age = 28; delete f.persona.gender;
@@ -89,6 +121,8 @@ await test('配角与世界书数量受限，过滤无效内容并规范化关�
   assert.deepEqual(d.worldbook[0].keys, ['钟楼', '书店', '雨天']);
   assert.ok(!('id' in d.supportingCharacters[0]));
   assert.equal(normalizeStoryDraft({ worldbook: [null, {}, { name: '空内容' }] }).worldbook.length, 0);
+  const typed = normalizeStoryDraft({ worldbook: [{ type: 'event', name: '事件', keys: ['钟楼'], requires: ['雨夜'], excludes: ['修复'], relationshipStage: '信任', content: '结果' }] }).worldbook[0];
+  assert.equal(typed.type, 'event'); assert.deepEqual(typed.requires, ['雨夜']); assert.deepEqual(typed.excludes, ['修复']);
 });
 await test('缺少必填字段时阻止创建，错误指出缺失内容', () => {
   assert.throws(() => validateStoryDraft(normalizeStoryDraft({})), /作品名称.*世界背景.*我的身份.*开场白/);
@@ -100,13 +134,38 @@ await test('直接生成前校验至少一个想法，不调用模型', async ()
 });
 await test('草稿请求使用访谈事实与小说格式，返回完整规范化资料', async () => {
   const draft = await generateStoryDraft({ async chat(messages, opts) {
-    assert.match(messages[0].content, /不替玩家决定言行/);
+    assert.match(messages[0].content, /玩家承接最多占开场正文10%/);
     assert.match(messages[0].content, /不要按姓名猜测性别/);
+    assert.match(messages[0].content, /shortTermGoal/);
+    assert.match(messages[0].content, /relationshipStage/);
+    assert.match(messages[0].content, /storyMechanics/);
+    assert.match(messages[0].content, /brakeConditions/);
+    assert.match(messages[0].content, /独立目标、顾虑、边界与行为线索/);
     assert.deepEqual(JSON.parse(messages[1].content), { 访谈回答: { idea: '现代山城' } });
-    assert.equal(opts.max_tokens, 3600);
+    assert.equal(opts.max_tokens, 6000);
     return { content: JSON.stringify(fixture()) };
   } }, { idea: '现代山城', secret: '不发送' });
   assert.equal(draft.title, '山城来信'); assert.equal(draft.character.voice, '清亮');
+});
+await test('草稿缺少必填人物字段时自动重试完整 JSON', async () => {
+  let calls = 0;
+  const result = await generateStoryDraft({ async chat(messages, opts) {
+    calls++;
+    assert.equal(opts.max_tokens, 6000);
+    if (calls === 1) return { content: JSON.stringify({ title: '标题', premise: '处境', world: '背景', opening: '开场' }) };
+    return { content: JSON.stringify({ ...fixture(), character: { name: '顾岚', personality: '谨慎' }, persona: { identity: '旧识' } }) };
+  } }, { idea: '故事' });
+  assert.equal(calls, 2); assert.equal(result.character.name, '顾岚'); assert.equal(result.persona.identity, '旧识');
+});
+await test('草稿缺少关系阶段或触发规则时自动重试补齐机制', async () => {
+  let calls = 0;
+  await generateStoryDraft({ async chat() {
+    calls++;
+    const draft = fixture();
+    if (calls === 1) delete draft.storyMechanics.brakeConditions;
+    return { content: JSON.stringify(draft) };
+  } }, { idea: '有阶段推进和分支条件的山城故事' });
+  assert.equal(calls, 2);
 });
 await test('模型损坏、截断、缺项与离线时不写入任何数据', async () => {
   seed(); const before = [...data];
@@ -130,11 +189,31 @@ await test('人物、世界背景与玩家身份均能进入实际提示词', ()
   assert.ok(cfg.blocks.every((b) => b.id && b.enabled));
 });
 await test('配角常驻、世界书按词触发，缺关键词使用条目名', () => {
-  const f = fixture(); f.worldbook[0].keys = [];
+  const f = fixture(); f.worldbook[0].name = '钟楼'; f.worldbook[0].keys = [];
   const { cfg } = buildStoryBundle(f);
   const support = cfg.entries.find((e) => e.constant), lore = cfg.entries.find((e) => !e.constant);
   assert.match(support.content, /老街邮递员/); assert.match(support.content, /认识顾岚的父亲/);
+  assert.match(support.content, /当前目标：确认旧信是否寄错/);
+  assert.match(support.content, /变化方向：从旁观者成为主动证人/);
   assert.deepEqual(lore.keys, ['钟楼']); assert.equal(cfg.entries.length, 2);
+  assert.equal(lore.type, 'event'); assert.deepEqual(lore.requires, ['雨夜']); assert.deepEqual(lore.excludes, ['钟楼已修复']);
+  assert.equal(lore.relationshipStage, '信任'); assert.match(lore.content, /可能隐瞒/);
+});
+await test('主要角色驱动字段进入角色卡和模型提示词', () => {
+  const { cfg, card } = buildStoryBundle(fixture());
+  assert.equal(card.shortTermGoal, '确认旧信寄件人'); assert.equal(card.longTermGoal, '保住老街书店');
+  const text = cfg.blocks.map((block) => block.content).join('\n');
+  for (const value of ['确认旧信寄件人', '再次失去家人', '学会接受帮助', '渴望亲近却习惯回避', '逐步学会信任伙伴']) assert.ok(text.includes(value));
+});
+await test('阶段、触发、刹车、后果和配角自主性进入新作品提示词', () => {
+  const { cfg } = buildStoryBundle(fixture());
+  const mechanics = cfg.blocks.find((block) => block.name === '剧情推进与互动机制')?.content || '';
+  for (const value of ['阶段与时间线', '关系阶段', '事件触发规则', '犹豫、拒绝与暂停', '选择的后续影响', '配角自主行动']) {
+    assert.ok(mechanics.includes(value), `缺少机制区块：${value}`);
+  }
+  assert.match(mechanics, /不按固定轮数跳阶段/);
+  assert.match(mechanics, /停止当前行动/);
+  assert.ok(cfg.blocks.some((block) => block.content.includes('找到寄件记录后才触发钟楼调查')));
 });
 await test('场景与默认记忆、四选项正确初始化，旧记忆为空', () => {
   const { cfg } = buildStoryBundle(fixture());

@@ -5,7 +5,7 @@ import { makeCard, cardToBlocks, generateExample, expandDirection, classifyStory
 import { makePersona } from './js/persona.js';
 import { profileEditor, PROFILE_FIELDS } from './js/profile.js';
 import { NOVEL_STYLE, migrateNarrativeInstructions } from './js/narrative.js';
-import { LENGTH_PRESETS, applyLengthSettings } from './js/prompts.js';
+import { MIN_BODY_CHARS, MAX_BODY_CHARS, TARGET_BODY_CHARS, getBodyLength, getBodyTarget, generationOptions } from './js/prompts.js';
 import { assemble, makeBlock } from './js/assembler.js';
 import { formatText, parseStructuredReply } from './js/render.js';
 
@@ -174,8 +174,10 @@ await test('AI 失败后按钮恢复，原资料完整', async () => {
 await test('AI 填入细节后自动展开，性别未知仍能看到结果', () => {
   assert.match(profileEditor({ abilities: '摄影' }), /<details class="profile-details" open>/);
 });
-await test('所有篇幅档位及角色卡都采用小说式格式', () => {
-  for (const preset of LENGTH_PRESETS) assert.ok(preset.content.includes(NOVEL_STYLE));
+await test('固定正文字数与角色卡统一使用小说格式', () => {
+  assert.equal(MIN_BODY_CHARS, 1000); assert.equal(MAX_BODY_CHARS, 2000); assert.equal(TARGET_BODY_CHARS, 1400);
+  assert.equal(getBodyTarget(), TARGET_BODY_CHARS); assert.equal(getBodyLength('甲 乙\n丙'), 3);
+  assert.deepEqual(generationOptions(), { max_tokens: 4600 });
   assert.ok(cardToBlocks(makeCard()).some((b) => b.content.includes(NOVEL_STYLE)));
 });
 await test('兼容旧主提示词和篇幅指令，不改普通正文括号', () => {
@@ -188,14 +190,10 @@ await test('兼容旧主提示词和篇幅指令，不改普通正文括号', ()
   assert.ok(system.includes(NOVEL_STYLE) && !system.includes(legacy));
   assert.ok(system.includes('<Scene>') && system.includes('<Choices>'));
 });
-await test('迁移旧篇幅预设时保留同一块，避免重复字数要求', () => {
-  for (const preset of LENGTH_PRESETS) {
-    const old = preset.content.replace(NOVEL_STYLE, preset.key === 'epic' ? '' : '用「」包裹台词，用（）包裹动作与神态描写。')
-      .replace('台词使用中文双引号“”。要有来有回，尊重玩家自行决定言行。', '用「」包裹。要有来有回，不要一个人说 monologue');
-    const cfg = { blocks: [makeBlock({ name: '主提示词', content: old })] };
-    applyLengthSettings(cfg, 'short', LENGTH_PRESETS[0].content);
-    assert.equal(cfg.blocks.length, 1); assert.equal(cfg.blocks[0].name, '篇幅要求');
-  }
+await test('作品结构化回复固定要求字数并排除思维链', () => {
+  const system = assemble({ responseFormat: { enabled: true }, narrativeStyle: true }).messages[0].content;
+  assert.match(system, /1000-2000/); assert.match(system, /不含思维链/);
+  assert.match(system, /<Player>/); assert.match(system, /<Situation>/);
 });
 await test('小说台词保留中文引号并高亮，流式半句不产生坏标签', () => {
   assert.equal(formatText('她推开门。\n“回来了？”'), '她推开门。<br><span class="quote">“回来了？”</span>');

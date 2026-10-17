@@ -45,7 +45,7 @@ export function personaToBlock(persona) {
 
   if (!parts.length) return null;
 
-  return `【玩家身份】\n${parts.join('\n')}\n\n请始终以 {{user}} 的上述身份作为互动对象，不要替 {{user}} 决定言行。`;
+  return `【玩家身份】\n${parts.join('\n')}\n\n请始终以 {{user}} 的上述身份作为互动对象。可以在正文中用不超过10%的篇幅承接玩家已经明确的言行，但不要替 {{user}} 决定关键行动、立场或目标。`;
 }
 
 /** 身份预设 */

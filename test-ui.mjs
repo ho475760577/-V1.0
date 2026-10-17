@@ -11,6 +11,8 @@ import * as S from './js/store.js';
 const els = {};
 globalThis.localStorage = {
   _d: {},
+  get length() { return Object.keys(this._d).length; },
+  key(index) { return Object.keys(this._d)[index] ?? null; },
   getItem(k) { return this._d[k] ?? null; },
   setItem(k, v) { this._d[k] = String(v); },
   removeItem(k) { delete this._d[k]; },
@@ -38,6 +40,7 @@ function stub() {
     appendChild() {}, onclick: null, onchange: null, oninput: null,
   };
 }
+
 function resetDOM(ids) {
   for (const k of Object.keys(els)) delete els[k];
   for (const id of ids) els[id] = stub();
@@ -47,6 +50,29 @@ let pass = 0, fail = 0;
 function check(name, cond, extra = '') {
   if (cond) { pass++; console.log(`  PASS  ${name}`); }
   else { fail++; console.log(`  FAIL  ${name} ${extra}`); }
+}
+
+/* ============ 完整作品备份恢复 ============ */
+console.log('\n=== 完整作品备份恢复 ===');
+{
+  S.saveConfig('backup_story', { name: '完整故事', entries: [{ type: 'event', requires: ['雨夜'] }] });
+  S.saveCard({ id: 'backup_card', name: '顾岚', shortTermGoal: '找到旧信' });
+  S.savePersona({ id: 'backup_persona', name: '周川', identity: '摄影师' });
+  S.saveChat('backup_story', [{ role: 'user', content: '打开信件' }], 'backup_card');
+  localStorage.setItem('sil.lastcard.backup_story', 'backup_card');
+  S.saveCreationDraft({ version: 1, answers: { idea: '山城故事' } });
+  const backup = S.exportWorkspaceBackup();
+  S.deleteConfig('backup_story'); S.deleteCard('backup_card'); S.clearChat('backup_story', 'backup_card');
+  S.importWorkspaceBackup(backup);
+  check('恢复作品、角色、身份和聊天', S.loadConfig('backup_story')?.entries[0].requires[0] === '雨夜'
+    && S.loadCard('backup_card')?.shortTermGoal === '找到旧信'
+    && S.loadPersona('backup_persona')?.identity === '摄影师'
+    && S.loadChat('backup_story', 'backup_card')[0].content === '打开信件');
+  check('恢复聊天角色绑定和未完成草稿', localStorage.getItem('sil.lastcard.backup_story') === 'backup_card'
+    && S.loadCreationDraft()?.answers.idea === '山城故事');
+  const before = JSON.stringify(S.listConfigs());
+  try { S.importWorkspaceBackup({ schema: 'wrong', version: 1, data: {} }); } catch {}
+  check('无效备份不会覆盖当前作品', JSON.stringify(S.listConfigs()) === before);
 }
 
 /* ============ 1. 角色卡界面渲染完整性 ============ */
@@ -69,12 +95,13 @@ console.log('\n=== 1. 角色卡界面渲染完整性 ===');
   const buttons = ['设为当前角色', '应用到作品设定', '导出', '导入', '上传头像'];
   for (const b of buttons) check(`按钮「${b}」存在`, h.includes(b));
 
-  const fields = ['角色名', '一句话身份', '外貌', '性格', '背景',
-    '说话方式', '故事情境', '开场白', '示例对话', '创作者备注'];
+  const fields = ['角色名', '一句话身份', '外貌', '性格', '背景', '说话方式',
+    '当前目标', '长期目标', '恐惧与顾虑', '内在需求', '内在矛盾', '底线与边界', '行为线索', '人物弧光',
+    '故事情境', '开场白', '示例对话', '创作者备注'];
   for (const f of fields) check(`字段「${f}」存在`, h.includes(f));
 
   const polishCount = (h.match(/data-ai="polish"/g) || []).length;
-  check('AI 美化按钮 8 个', polishCount === 8, `实际 ${polishCount}`);
+  check('AI 美化按钮覆盖基础资料与角色驱动字段', polishCount === 16, `实际 ${polishCount}`);
   check('人物细节单项美化按钮 7 个', (h.match(/data-profile-field="/g) || []).length === 7);
   check('AI 生成示例对话按钮', h.includes('AI 生成示例对话'));
 
@@ -211,6 +238,7 @@ console.log('\n=== 7. 角色卡导入导出 ===');
     name: '林晚', tagline: '咖啡馆店主', appearance: '黑长发',
     personality: '冷淡但关心人', background: '独自经营三年',
     speechStyle: '说话简短', creatorNotes: '备注', avatar: 'data:image/jpeg;base64,abc',
+    shortTermGoal: '找回旧钥匙', arc: '从疏离走向信任',
   });
   const back = importCard(exportCard(card));
   check('名字', back.name === '林晚');
@@ -221,6 +249,7 @@ console.log('\n=== 7. 角色卡导入导出 ===');
   check('说话方式', back.speechStyle === '说话简短');
   check('创作者备注', back.creatorNotes === '备注');
   check('头像保留', back.avatar === 'data:image/jpeg;base64,abc');
+  check('角色驱动字段导入导出', back.shortTermGoal === card.shortTermGoal && back.arc === card.arc);
 }
 
 /* ============ 8. cardToBlocks 映射 ============ */
@@ -288,6 +317,24 @@ console.log('\n=== 9. 变量面板状态解析 ===');
   check('结构化标签从正文移除', !structured.text.includes('<Scene>') && structured.text.includes('继续走吧'));
   const malformed = parseStructuredReply('正文\n<Scene>{bad}</Scene>');
   check('坏 Scene 标签不吞正文', malformed.text.includes('正文') && malformed.text.includes('<Scene>'));
+
+  const rich = parseStructuredReply([
+    '环境描写',
+    '<Scene>{"time":"夜里","world":"归墟档案","location":"高速公路","plot":"等待玩家回应","weather":"小雨","lighting":"路灯","sounds":["雨声"],"participants":[{"name":"苏瑶","position":"车内","emotion":"警觉","action":"握紧方向盘"}],"objects":[{"name":"旧信","location":"副驾驶","status":"未拆封"}],"goal":"找到钟楼","conflict":"有人跟踪","tension":7}</Scene>',
+    '<Changes>{"discoveries":["发现旧信"],"events":["车辆驶入小巷"],"goals":["确认信件来源"]}</Changes>',
+    '<Choices>[{"text":"检查旧信","type":"investigate","intent":"寻找线索","risk":"可能暴露行踪"}]</Choices>',
+  ].join('\n'));
+  check('解析富场景环境', rich.scene?.weather === '小雨' && rich.scene?.participants?.[0]?.position === '车内');
+  check('解析场景头情节', rich.scene?.world === '归墟档案' && rich.scene?.plot === '等待玩家回应');
+  check('解析场景物品与目标冲突', rich.scene?.objects?.[0]?.status === '未拆封' && rich.scene?.conflict === '有人跟踪');
+  check('解析本轮变化', rich.changes?.discoveries?.[0] === '发现旧信' && rich.changes?.events?.[0] === '车辆驶入小巷');
+  check('解析带元数据行动选项', rich.choices?.[0]?.text === '检查旧信' && rich.choices?.[0]?.risk === '可能暴露行踪');
+
+  const escaped = parseStructuredReply('正文\n&lt;Scene&gt;{"time":"凌晨2点","location":"卧室"}&lt;/Scene&gt;');
+  check('兼容 HTML 转义的场景标签', escaped.scene?.location === '卧室' && escaped.text === '正文');
+
+  const missingOpen = parseStructuredReply('正文\nScene&gt;{"time":"凌晨2点","location":"卧室"}&lt;/Scene&gt;');
+  check('兼容漏掉左尖括号的场景标签', missingOpen.scene?.location === '卧室' && missingOpen.text === '正文');
 }
 
 console.log(`\n${'='.repeat(46)}`);

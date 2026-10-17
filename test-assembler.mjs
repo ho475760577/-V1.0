@@ -22,6 +22,15 @@ check('正则语法', isEntryActive(makeEntry({ keys: ['/小(明|红)/'] }), '�
 check('仅扫用户', !isEntryActive(makeEntry({ keys: ['秘密'], scan: SCAN.USER }), '无关', '这是秘密'));
 check('仅扫AI', isEntryActive(makeEntry({ keys: ['秘密'], scan: SCAN.AI }), '无关', '这是秘密'));
 check('禁用条目不触发', !isEntryActive(makeEntry({ keys: ['A'], enabled: false }), 'A', ''));
+check('关系阶段门槛匹配当前角色状态', isEntryActive(makeEntry({ keys: ['舞会'], relationshipStage: '信任' }), '舞会', '', {
+  characters: [{ name: '顾岚', relationship: '从试探走向信任' }],
+}));
+check('不满足关系阶段不触发', !isEntryActive(makeEntry({ keys: ['舞会'], relationshipStage: '亲密' }), '舞会', '', {
+  characters: [{ name: '顾岚', relationship: '从试探走向信任' }],
+}));
+check('必须条件与排除条件参与触发',
+  isEntryActive(makeEntry({ keys: ['钟楼'], requires: ['发现旧信'] }), '钟楼', '', { situation: { openThreads: ['发现旧信'] } })
+  && !isEntryActive(makeEntry({ keys: ['钟楼'], excludes: ['钟楼已拆除'] }), '钟楼', '', { scene: { plot: '钟楼已拆除' } }));
 
 console.log('\n=== 2. 插入顺序 ===');
 {
@@ -44,6 +53,14 @@ console.log('\n=== 3. 禁用块不参与 ===');
   const { messages } = assemble({ blocks, userInput: 'hi' });
   const sys = messages.find((m) => m.role === 'system').content;
   check('禁用块被排除', sys === '启用内容', `实际: ${JSON.stringify(sys)}`);
+}
+
+console.log('\n=== 3b. 旧篇幅块兼容 ===');
+{
+  const { messages } = assemble({ blocks: [makeBlock({ name: '篇幅要求', content: '旧规则：必须写 5000 字。' })],
+    responseFormat: { enabled: true } });
+  const system = messages.find((message) => message.role === 'system').content;
+  check('旧档位设定不再注入', !system.includes('5000 字') && system.includes('1000-2000'));
 }
 
 console.log('\n=== 4. 空块不产生空行 ===');
@@ -192,17 +209,43 @@ console.log('\n=== 12e. 结构化格式与场景配置 ===');
   const { messages } = assemble({
     blocks: [], userInput: '继续',
     responseFormat: { enabled: true, showReview: true },
-    scene: { time: '第1天 14:30', world: '现代都市', location: '高速公路' },
+    scene: { time: '第1天 14:30', world: '现代都市', location: '高速公路', plot: '角色等待玩家回应' },
   });
   const sys = messages.find((m) => m.role === 'system').content;
   check('结构化回复规范注入', sys.includes('<Scene>') && sys.includes('<Review>'));
-  check('当前场景注入 system', sys.includes('高速公路') && sys.includes('第1天 14:30'));
+  check('玩家描写限制为正文10%', sys.includes('至少90%') && sys.includes('最多10%'));
+  check('成人情节允许细致描写', sys.includes('成人向') && sys.includes('露骨、直接、细致'));
+  check('当前场景注入 system', sys.includes('高速公路') && sys.includes('第1天 14:30') && sys.includes('角色等待玩家回应'));
+  const continuity = assemble({ playerState: { status: '手持旧信' },
+    characters: [{ name: '顾岚', relationship: '开始信任', goal: '找到寄件人' }],
+    situation: { risks: ['有人监视'], openThreads: ['钟楼停摆'] }, userInput: '继续' }).messages[0].content;
+  check('玩家、角色关系与局势状态跨轮注入', continuity.includes('手持旧信') && continuity.includes('开始信任')
+    && continuity.includes('有人监视') && continuity.includes('钟楼停摆'));
   const cfg = importConfig(exportConfig({
     name: '场景测试', blocks: [], entries: [],
     scene: { time: '晚上', world: '架空世界', location: '旅馆' },
     responseFormat: { enabled: true, showReview: false },
   }));
   check('结构化配置导入导出', cfg.scene.location === '旅馆' && cfg.responseFormat.enabled === true);
+}
+
+console.log('\n=== 12f. 富场景与行动选项提示 ===');
+{
+  const { messages } = assemble({
+    userInput: '检查现场',
+    scene: {
+      time: '雨夜', location: '旧书店', weather: '小雨', lighting: '昏黄', sounds: ['雨声'],
+      participants: [{ name: '顾岚', position: '柜台后', emotion: '警觉', action: '翻找账本' }],
+      objects: [{ name: '旧信', location: '桌面', status: '未拆封' }], goal: '确认信件来源', conflict: '有人监视',
+    },
+    choices: { enabled: true },
+    responseFormat: { enabled: true, showReview: false },
+  });
+  const sys = messages.find((m) => m.role === 'system').content;
+  check('环境细节注入提示词', sys.includes('小雨') && sys.includes('昏黄') && sys.includes('雨声'));
+  check('人物位置与物品注入提示词', sys.includes('柜台后') && sys.includes('旧信') && sys.includes('未拆封'));
+  check('本轮变化协议注入提示词', sys.includes('<Changes>') && sys.includes('discoveries'));
+  check('行动类型与风险协议注入提示词', sys.includes('investigate|dialogue|move|use') && sys.includes('可能代价或风险'));
 }
 
 console.log('\n=== 13. 空输入不产生空消息 ===');

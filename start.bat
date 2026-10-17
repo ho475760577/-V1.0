@@ -1,17 +1,18 @@
 @echo off
 setlocal EnableExtensions
-title StoryRealm v1.0
+title StoryRealm v3.0.3
 
 set "APP_DIR=%~dp0"
 set "LLAMA_DIR=%APP_DIR%runtime\llama-cpp"
-set "MODEL=%APP_DIR%models\model.gguf"
+set "MODEL=D:\SI\Models\gemma-4-12B Q4_K_M\gemma4-e4b-mahou-nsfw.i1-Q4_K_M.gguf"
 if exist "%APP_DIR%start.local.bat" call "%APP_DIR%start.local.bat"
+if not defined LLAMA_CTX set "LLAMA_CTX=12288"
 set "LLAMA_EXE=%LLAMA_DIR%\llama-server.exe"
 set "LLAMA_URL=http://127.0.0.1:8080/health"
 set "WEB_URL=http://127.0.0.1:5173"
 
 echo ========================================
-echo   StoryRealm v1.0 - Start All
+echo   StoryRealm v3.0.3 - Start All
 echo ========================================
 echo.
 
@@ -22,15 +23,17 @@ echo [1/3] Checking llama.cpp...
 curl -s -m 2 "%LLAMA_URL%" >nul 2>&1
 if not errorlevel 1 goto llama_ready
 echo       Starting llama.cpp. First load may take a few minutes...
-start "llama.cpp server" /D "%LLAMA_DIR%" "%LLAMA_EXE%" -m "%MODEL%" -c 8192 -ngl 99 --jinja --host 127.0.0.1 --port 8080
+start "llama.cpp server" /D "%LLAMA_DIR%" "%LLAMA_EXE%" -m "%MODEL%" -c %LLAMA_CTX% -ngl 99 --jinja --reasoning off --reasoning-budget 0 --host 127.0.0.1 --port 8080
 :llama_ready
 echo       llama.cpp is ready or still loading.
 
 echo [2/3] Checking web server...
-curl -s -m 2 "%WEB_URL%/" >nul 2>&1
+curl -s -m 2 "%WEB_URL%/api/workspace" >nul 2>&1
 if not errorlevel 1 goto web_ready
-echo       Starting Python web server...
-start "StoryRealm web server" /D "%APP_DIR%" "%ComSpec%" /k python -m http.server 5173 --bind 127.0.0.1
+curl -s -m 2 "%WEB_URL%/" >nul 2>&1
+if not errorlevel 1 goto old_web_server
+echo       Starting StoryRealm web server with local persistence...
+start "StoryRealm web server" /D "%APP_DIR%" "%ComSpec%" /k python "%APP_DIR%server.py" --port 5173 --bind 127.0.0.1
 
 echo [3/3] Waiting for web server...
 set /a WEB_TRIES=0
@@ -54,6 +57,13 @@ echo Close those windows to stop the services.
 echo.
 pause
 exit /b 0
+
+:old_web_server
+echo [WARNING] Port 5173 is occupied by an older web server without file persistence.
+echo           Close that server window and run start.bat again.
+start "" "%WEB_URL%"
+pause
+exit /b 1
 
 :web_timeout
 echo [WARNING] Web server did not respond. Check that Python is installed.
