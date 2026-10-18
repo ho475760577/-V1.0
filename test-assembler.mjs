@@ -214,7 +214,7 @@ console.log('\n=== 12e. 结构化格式与场景配置 ===');
   const sys = messages.find((m) => m.role === 'system').content;
   check('结构化回复规范注入', sys.includes('<Scene>') && sys.includes('<Review>'));
   check('玩家描写限制为正文10%', sys.includes('至少90%') && sys.includes('最多10%'));
-  check('成人情节允许细致描写', sys.includes('成人向') && sys.includes('露骨、直接、细致'));
+  check('成人亲密情节须由用户明确引入', sys.includes('只有用户明确提出后才描写成人亲密内容'));
   check('当前场景注入 system', sys.includes('高速公路') && sys.includes('第1天 14:30') && sys.includes('角色等待玩家回应'));
   const continuity = assemble({ playerState: { status: '手持旧信' },
     characters: [{ name: '顾岚', relationship: '开始信任', goal: '找到寄件人' }],

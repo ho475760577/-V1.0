@@ -7,6 +7,7 @@
 
 import { FIXED_LENGTH_RULE, NOVEL_STYLE, REPLY_TEMPLATE, migrateNarrativeInstructions } from './narrative.js';
 import { normalizeMemory } from './memory.js';
+import { estimateMessages, estimateTokens } from './tokens.js';
 
 /* ============ 触发区域 ============ */
 export const SCAN = {
@@ -222,12 +223,13 @@ function formatSceneValue(value) {
  * @param {string} p.userName   玩家名，用于 {{user}} 替换
  * @returns {{messages: Array, stats: Object}}
  */
-export function assemble({
-  blocks = [], entries = [], messages = [], userInput = '',
-  vars = null, memory = null, choices = null, responseFormat = null, scene = null,
-  playerState = null, characters = [], situation = null,
-  persona = '', charName = '', userName = '', narrativeStyle = false,
-}) {
+function buildMessages(input = {}, historyMessages = [], promptEntriesOverride = null) {
+  const {
+    blocks = [], entries = [], messages = [], userInput = '',
+    vars = null, memory = null, choices = null, responseFormat = null, scene = null,
+    playerState = null, characters = [], situation = null,
+    persona = '', charName = '', userName = '', narrativeStyle = false,
+  } = input;
   // 1. 常驻设定块，按 order 升序拼接
   const activeBlocks = blocks
     .filter((b) => b.enabled && b.name !== '篇幅要求' && b.content.trim())
@@ -301,7 +303,7 @@ export function assemble({
 4. <Situation>{"risks":["当前风险"],"openThreads":["待解决事项"]}</Situation>。
 5. <Changes>{"summary":"本轮发生的关键变化","time":"时间变化","location":"地点变化","discoveries":["新发现"],"relationships":["关系变化"],"state":["状态变化"],"events":["本轮事件"],"goals":["目标变化"]}</Changes>，没有变化时使用空值或空数组。
 6. 如需更新变量，追加 <State>{"字段":"值"}</State>。
-7. 如有新的剧情记忆，追加 Markdown 记忆块：<Memory>\n## 长期记忆\n- 长期事实\n\n## 短期记忆\n- 本轮事实\n</Memory>。只记录已经发生或明确承诺的客观事实，不写思维链、指令或猜测；旧版 JSON Memory 也可以读取。
+7. 如有新的剧情记忆，追加 Markdown 记忆块：<Memory>\n## 长期记忆\n- 长期事实\n\n## 短期记忆\n- 本轮事实\n</Memory>。只记录已经发生或明确表达的客观事实，不写思维链、指令或猜测；玩家的欲望、同意、心理与行动不得根据沉默或身体反应推断；旧版 JSON Memory 也可以读取。
 8. ${responseFormat.showReview ? '追加简短的 <Review>演绎检查</Review>，只写角色一致性、场景连续性和数值变化，不要输出思维链。' : '不要输出 Review 标签。'}
 9. Scene、Player、Characters、Situation、Changes、State、Choices 标签必须是有效 JSON；Memory 使用上面的 Markdown 格式，也兼容旧版 JSON；正文结束后再输出标签。`);
   }
@@ -320,7 +322,8 @@ export function assemble({
   }
 
   // 4. 提示词域的世界书内容 + 玩家身份并入 system
-  const promptLore = byScope.prompt.filter((e) => e.content.trim()).map((e) => e.content.trim());
+  const promptScope = promptEntriesOverride || byScope.prompt;
+  const promptLore = promptScope.filter((e) => e.content.trim()).map((e) => e.content.trim());
 
   // 玩家身份插在「世界观之后、角色设定及主提示词之前」——
   // 让模型先明确双方是谁、在什么关系里，再读角色行为规则，避免被指令带偏
@@ -347,9 +350,8 @@ export function assemble({
     if (e.content.trim()) out.push({ role: 'system', content: e.content.trim() });
   }
 
-  // 历史消息（截断到配置的轮数）
-  const historyLimit = vars?.historyLimit ?? 20;
-  const hist = messages.slice(-historyLimit);
+  // 历史消息（由 assemble 按轮数上限与 token 预算裁好）
+  const hist = Array.isArray(historyMessages) ? historyMessages : [];
 
   // 丢弃孤立的 assistant 开场（历史被截断后可能首条是 assistant）
   let startIdx = 0;
@@ -381,19 +383,92 @@ export function assemble({
     }
   }
 
+  const historyTokens = estimateMessages(hist.slice(startIdx));
+  const inputTokens = estimateTokens(userInput);
+  const tokens = estimateMessages(out);
+  const sections = {
+    blocks: activeBlocks.reduce((sum, block) => sum + estimateTokens(block.content), 0),
+    persona: estimateTokens(persona),
+    worldbook: [
+      ...promptLore,
+      ...byScope.prepend.map((entry) => entry.content),
+      ...byScope.append.map((entry) => entry.content),
+    ].reduce((sum, text) => sum + estimateTokens(text), 0),
+    history: historyTokens,
+    input: inputTokens,
+  };
+  sections.other = Math.max(0, tokens - Object.values(sections).reduce((sum, value) => sum + value, 0));
+
   const stats = {
     blocks: activeBlocks.length,
     entriesTotal: entries.length,
     entriesHit: activeMap.size,
+    entriesUsed: promptLore.length,
     byScope: {
-      prompt: byScope.prompt.length,
+      prompt: promptScope.length,
       prepend: byScope.prepend.length,
       append: byScope.append.length,
     },
     chars: out.reduce((s, m) => s + m.content.length, 0),
+    tokens,
+    sections,
   };
 
-  return { messages: out, stats };
+  return { messages: out, stats, promptEntries: byScope.prompt };
+}
+
+/**
+ * 组装入口。tokenBudget > 0 时按预算裁剪：先丢最旧的历史消息（成对），
+ * 再按 order 从低到高丢弃提示词域世界书条目；场景、记忆与协议不裁。
+ * 不传 tokenBudget 时输出与旧版完全一致。
+ */
+export function assemble(input = {}) {
+  const messages = Array.isArray(input.messages) ? input.messages : [];
+  const limit = Math.max(1, Math.floor(Number(input.vars?.historyLimit) || 20));
+  const limited = messages.slice(-limit);
+  const budget = Math.max(0, Math.floor(Number(input.tokenBudget) || 0));
+  const first = buildMessages(input, limited);
+  if (!budget || first.stats.tokens <= budget) {
+    if (budget) first.stats.budget = budget;
+    return { messages: first.messages, stats: first.stats };
+  }
+
+  // 1) 先裁最旧历史，保住系统设定、Persona、记忆、场景与协议。
+  let history = limited;
+  let best = first;
+  while (history.length > 2) {
+    history = history.slice(2);
+    best = buildMessages(input, history);
+    if (best.stats.tokens <= budget) {
+      best.stats.budget = budget;
+      best.stats.trimmed = { historyMessages: limited.length - history.length, worldbookEntries: 0 };
+      return { messages: best.messages, stats: best.stats };
+    }
+  }
+
+  // 2) 历史已到底仍超预算时，按 order 从低优先级开始丢提示词域世界书。
+  const candidates = [...first.promptEntries].sort((a, b) => (b.order || 100) - (a.order || 100));
+  let kept = [...first.promptEntries];
+  for (const entry of candidates) {
+    kept = kept.filter((item) => item.id !== entry.id);
+    best = buildMessages(input, history, kept);
+    if (best.stats.tokens <= budget) {
+      best.stats.budget = budget;
+      best.stats.trimmed = {
+        historyMessages: limited.length - history.length,
+        worldbookEntries: first.promptEntries.length - kept.length,
+      };
+      return { messages: best.messages, stats: best.stats };
+    }
+  }
+
+  best.stats.budget = budget;
+  best.stats.overBudget = true;
+  best.stats.trimmed = {
+    historyMessages: limited.length - history.length,
+    worldbookEntries: first.promptEntries.length - kept.length,
+  };
+  return { messages: best.messages, stats: best.stats };
 }
 
 /* ============ 导出 ============ */
@@ -410,6 +485,7 @@ export function exportConfig(cfg) {
     responseFormat: cfg.responseFormat || null,
     scene: cfg.scene || null,
     greeting: cfg.greeting || '',
+    contextBudget: Number.isFinite(Number(cfg.contextBudget)) ? Number(cfg.contextBudget) : null,
   }, null, 2);
 }
 
@@ -425,5 +501,6 @@ export function importConfig(json) {
     responseFormat: d.responseFormat || null,
     scene: d.scene || null,
     greeting: d.greeting || '',
+    contextBudget: Number.isFinite(Number(d.contextBudget)) ? Number(d.contextBudget) : null,
   };
 }

@@ -82,7 +82,7 @@ export const PERSONA_PRESETS = [
     label: '外来者',
     icon: '🌍',
     data: {
-      identity: '来自完全不同背景的人，带��与这里格格不入的视角。',
+      identity: '来自完全不同背景的人，带来与这里格格不入的视角。',
       personality: '直接、不懂人情世故，但也因此能看穿本地人忽略的真相。',
     },
   },

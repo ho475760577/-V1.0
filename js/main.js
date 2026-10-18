@@ -2,7 +2,7 @@
  * 主界面逻辑
  */
 import { assemble, makeBlock, makeEntry, SCAN, MATCH, SCOPE, ENTRY_TYPE_LABELS, exportConfig, importConfig } from './assembler.js';
-import { llm, LLM } from './llm.js';
+import { llm } from './llm.js';
 import * as store from './store.js';
 import { parseReply, parseState, parseStructuredReply, serializeStructuredReply, buildPanelFrame, formatText, escapeHtml } from './render.js';
 import { initCard, selectCard as selectEditorCard } from './card-panel.js';
@@ -13,8 +13,11 @@ import { profileAIEditor, bindProfileAI } from './profile-assist.js';
 import { migrateNarrativeInstructions } from './narrative.js';
 import { openStoryCreator } from './story-creator-panel.js';
 import { mergeMemory, memoryToMarkdown, normalizeMemory, parseMemoryMarkdown } from './memory.js';
+import { variantsOf, variantIndex, cycleVariant, editMessage, regenerationPlan, withVariant } from './message-actions.js';
+import { formatTokenCount } from './tokens.js';
 
 const $ = (id) => document.getElementById(id);
+const DEFAULT_CONTEXT_BUDGET = 7000;
 const EMPTY_SCENE = {
   time: '', world: '', location: '', plot: '', weather: '', atmosphere: '', lighting: '',
   sounds: [], scents: [], participants: [], objects: [], goal: '', conflict: '', tension: '',
@@ -30,6 +33,8 @@ const state = {
   busy: false,
   memoryBusy: false,
   streaming: false,
+  editing: null,       // 正在内联编辑的消息下标
+  abortController: null,
   contextVersion: 0,
   tab: 'card',
 };
@@ -57,6 +62,8 @@ async function init() {
   renderPersona();
   bindEvents();
   checkHealth();
+  startHealthWatch();
+  window.addEventListener('beforeunload', flushPersist);
 
   initCard(
     () => state.cfg,
@@ -64,11 +71,15 @@ async function init() {
     () => { renderBlocks(); renderVars(); renderChat(); },
     (cardId) => { switchCast(cardId); }
   );
+  // initCard 可能自动创建第一张角色卡，补一次角色栏渲染。
+  renderCastBar();
 }
 
 /* ============ 作品管理 ============ */
 function newConfig() {
+  flushPersist();
   state.contextVersion += 1;
+  state.editing = null;
   state.configId = 'cfg_' + Date.now().toString(36);
   state.cfg = {
     name: '新作品',
@@ -81,6 +92,7 @@ function newConfig() {
     scene: { ...EMPTY_SCENE },
     greeting: '',
     personaId: null,
+    contextBudget: DEFAULT_CONTEXT_BUDGET,
   };
   state.messages = [];
   state.cardId = null;
@@ -98,8 +110,10 @@ function newConfig() {
 }
 
 function selectConfig(id) {
+  flushPersist();
   const cfg = store.loadConfig(id);
   if (!cfg) return newConfig();
+  state.editing = null;
   state.configId = id;
   state.cfg = {
     ...cfg,
@@ -108,6 +122,7 @@ function selectConfig(id) {
     // 旧作品没有该字段时，默认恢复结构化剧情模板；明确关闭的作品仍保持关闭。
     responseFormat: { enabled: cfg.responseFormat?.enabled ?? true, showReview: false, ...(cfg.responseFormat || {}) },
     scene: { ...EMPTY_SCENE, ...(cfg.scene || {}) },
+    contextBudget: Number.isFinite(Number(cfg.contextBudget)) ? Number(cfg.contextBudget) : DEFAULT_CONTEXT_BUDGET,
   };
   // 兼容已保存作品中的旧版格式指令，不改聊天历史、开场白或人物正文。
   for (const block of state.cfg.blocks || []) {
@@ -153,6 +168,55 @@ function persistConversation(context) {
   store.saveConfig(context.configId, context.cfg);
   store.saveChat(context.configId, context.messages, context.cardId);
   if (context.cardId) store.setLastCard(context.configId, context.cardId);
+}
+
+/* ============ 写入节流与流式辅助 ============ */
+let persistTimer = 0;
+
+/** 文本输入用：250ms 合并写入，避免每次按键都序列化整份配置。 */
+function persistSoon() {
+  clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => { persistTimer = 0; persist(); }, 250);
+}
+
+/** 切作品、发送、导入前必须落盘。 */
+function flushPersist() {
+  if (!persistTimer) return;
+  clearTimeout(persistTimer);
+  persistTimer = 0;
+  persist();
+}
+
+const parseCache = new Map();
+
+/** 已保存消息按内容缓存解析结果，长聊天重绘时不再重复解析。 */
+function parseCached(content) {
+  const key = String(content ?? '');
+  const hit = parseCache.get(key);
+  if (hit) return hit;
+  const parsed = parseStructuredReply(key);
+  if (parseCache.size >= 240) parseCache.delete(parseCache.keys().next().value);
+  parseCache.set(key, parsed);
+  return parsed;
+}
+
+const STREAM_TAG_NAMES = 'Scene|Player|Characters|Situation|State|Changes|Memory|Choices|Review';
+const STREAM_COMPLETE_TAG = new RegExp(`<(${STREAM_TAG_NAMES})>[\\s\\S]*?<\\/\\1>`, 'gi');
+const STREAM_OPEN_TAG = new RegExp(`<(${STREAM_TAG_NAMES})>`, 'i');
+
+/** 流式期间只提取可见正文，避免每个 chunk 做完整结构化解析。 */
+function streamingVisibleText(raw) {
+  let text = String(raw || '');
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/<think>[\s\S]*$/i, '');
+  text = text.replace(STREAM_COMPLETE_TAG, '');
+  const open = text.search(STREAM_OPEN_TAG);
+  if (open >= 0) text = text.slice(0, open);
+  return text.trim();
+}
+
+function contextBudget() {
+  const value = Number(state.cfg?.contextBudget);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }
 
 function applyCardToConfig(blocks) {
@@ -215,7 +279,9 @@ function cardAvatarOf(card) {
 
 function switchCast(cardId) {
   if (cardId === state.cardId) return;
+  flushPersist();
   state.contextVersion += 1;
+  state.editing = null;
   state.cardId = cardId;
   state.messages = store.loadChat(state.configId, cardId);
   persist();
@@ -444,6 +510,15 @@ async function checkHealth() {
   txt.title = ok ? `已连接 ${llm.base}` : '请先启动 llama-server';
 }
 
+let healthTimer = 0;
+
+/** 每 15 秒复查一次模型状态；页面回到前台时立即复查。 */
+function startHealthWatch() {
+  if (healthTimer) return;
+  healthTimer = setInterval(() => { if (!document.hidden) checkHealth(); }, 15000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) checkHealth(); });
+}
+
 /* ============ 生成参数 ============ */
 function genOpts() {
   return generationOptions(state.cfg);
@@ -478,8 +553,8 @@ function renderBlocks() {
     const updateCount = () => { counter.textContent = body.value.length + ' 字'; };
     updateCount();
 
-    body.oninput = () => { find().content = body.value; updateCount(); persist(); };
-    card.querySelector('.bc-name').oninput = (e) => { find().name = e.target.value; persist(); renderConfigList(); };
+    body.oninput = () => { find().content = body.value; updateCount(); persistSoon(); };
+    card.querySelector('.bc-name').oninput = (e) => { find().name = e.target.value; persistSoon(); renderConfigList(); };
     card.querySelector('.bc-order').onchange = (e) => { find().order = parseInt(e.target.value) || 0; persist(); renderBlocks(); };
     card.querySelector('.bc-on').onchange = (e) => { find().enabled = e.target.checked; persist(); };
     card.querySelector('.del').onclick = () => {
@@ -543,23 +618,23 @@ function renderEntries() {
     card.querySelector('.ec-on').onchange = (e) => { find().enabled = e.target.checked; persist(); renderEntries(); };
     card.querySelector('.ec-const').onchange = (e) => { find().constant = e.target.checked; persist(); };
     card.querySelector('.ec-type').onchange = (e) => { find().type = e.target.value; persist(); };
-    card.querySelector('.ec-cat').oninput = (e) => { find().category = e.target.value; persist(); };
+    card.querySelector('.ec-cat').oninput = (e) => { find().category = e.target.value; persistSoon(); };
     card.querySelector('.ec-order').onchange = (e) => { find().order = parseInt(e.target.value) || 100; persist(); };
     card.querySelector('.ec-scan').onchange = (e) => { find().scan = e.target.value; persist(); };
     card.querySelector('.ec-match').onchange = (e) => { find().match = e.target.value; persist(); };
     card.querySelector('.ec-scope').onchange = (e) => { find().scope = e.target.value; persist(); };
     card.querySelector('.ec-keys').oninput = (e) => {
       find().keys = e.target.value.split(/[,，\n]/).map((s) => s.trim()).filter(Boolean);
-      persist();
+      persistSoon();
     };
     for (const [selector, key] of [['.ec-requires', 'requires'], ['.ec-excludes', 'excludes']]) {
       card.querySelector(selector).oninput = (event) => {
         find()[key] = event.target.value.split(/[,，\n]/).map((value) => value.trim()).filter(Boolean);
-        persist();
+        persistSoon();
       };
     }
-    card.querySelector('.ec-stage').oninput = (event) => { find().relationshipStage = event.target.value.trim(); persist(); };
-    card.querySelector('.ec-body').oninput = (e) => { find().content = e.target.value; persist(); };
+    card.querySelector('.ec-stage').oninput = (event) => { find().relationshipStage = event.target.value.trim(); persistSoon(); };
+    card.querySelector('.ec-body').oninput = (e) => { find().content = e.target.value; persistSoon(); };
     card.querySelector('.ec-del').onclick = () => {
       state.cfg.entries = state.cfg.entries.filter((x) => x.id !== id);
       persist(); renderEntries(); renderConfigList();
@@ -575,6 +650,7 @@ function renderVars() {
   $('varsHistory').value = v.historyLimit || 20;
   $('varsPanel').style.display = v.enabled ? 'block' : 'none';
   if ($('greetingBox')) $('greetingBox').value = state.cfg.greeting || '';
+  if ($('contextBudget')) $('contextBudget').value = state.cfg.contextBudget ?? DEFAULT_CONTEXT_BUDGET;
   renderStatePanel();
   renderMemory();
   if ($('choicesOn')) $('choicesOn').checked = !!state.cfg.choices?.enabled;
@@ -649,7 +725,8 @@ function applyStructuredReplyToConfig(raw, cfg) {
     changed = true;
   }
 
-  if (parsed.player) { cfg.playerState = parsed.player; changed = true; }
+  // Player state is shown with the reply, but model inference is not authoritative
+  // enough to become persistent player intent, emotion, consent, or action.
   if (parsed.characters) { cfg.characterStates = parsed.characters; changed = true; }
   if (parsed.situation) { cfg.situation = parsed.situation; changed = true; }
 
@@ -768,11 +845,70 @@ function renderChat() {
     box.appendChild(g);
   }
 
-  for (const m of state.messages) box.appendChild(bubbleFor(m));
+  for (const [index, m] of state.messages.entries()) box.appendChild(bubbleFor(m, index));
   scrollDown();
 }
 
-function bubbleFor(m) {
+function editForm(content) {
+  return `<div class="msg-edit">
+    <textarea rows="8" data-edit-input>${escapeHtml(content)}</textarea>
+    <div class="btn-row"><button class="mini-btn primary" data-edit-save>保存</button><button class="mini-btn" data-edit-cancel>取消</button></div>
+  </div>`;
+}
+
+function bindEdit(root, index) {
+  const save = root.querySelector('[data-edit-save]');
+  if (!save) return;
+  const input = root.querySelector('[data-edit-input]');
+  save.onclick = () => saveEdit(index, input.value);
+  root.querySelector('[data-edit-cancel]').onclick = () => { state.editing = null; renderChat(); };
+  input.focus();
+}
+
+function startEdit(index) {
+  if (state.busy || state.memoryBusy) return;
+  state.editing = index;
+  renderChat();
+}
+
+function saveEdit(index, value) {
+  const current = state.messages[index];
+  if (!current) return;
+  const text = String(value || '').trim();
+  if (!text) { alert('消息内容不能为空'); return; }
+  state.messages[index] = editMessage(current, text);
+  state.editing = null;
+  persist();
+  renderChat();
+}
+
+function switchVariant(index, step) {
+  const current = state.messages[index];
+  if (!current) return;
+  state.messages[index] = cycleVariant(current, step);
+  persist();
+  renderChat();
+}
+
+async function regenerate(index) {
+  if (state.busy || state.memoryBusy) return;
+  const plan = regenerationPlan(state.messages, index);
+  if (!plan) { alert('这条消息前面没有可用的玩家输入，无法重新生成'); return; }
+  const after = state.messages.length - index - 1;
+  const message = after > 0
+    ? `重新生成会删除这条回复之后的 ${after} 条消息，并保留这条回复的旧版本。继续？`
+    : '重新生成会替换这条回复，旧版本会保留在版本切换里。继续？';
+  if (!confirm(message)) return;
+  state.editing = null;
+  await generateReply({
+    promptHistory: plan.promptHistory,
+    baseMessages: plan.baseMessages,
+    userText: plan.userText,
+    variantsSource: plan.replaced,
+  });
+}
+
+function bubbleFor(m, index) {
   const div = document.createElement('div');
   div.className = 'msg ' + m.role;
 
@@ -786,16 +922,57 @@ function bubbleFor(m) {
       </span>
       <div class="bubble">
         <div class="msg-who">${escapeHtml(who)}</div>
-        ${formatText(escapeHtml(m.content))}
+        ${state.editing === index ? editForm(m.content) : formatText(escapeHtml(m.content))}
+      </div>
+      <div class="msg-bar">
+        <span class="st"></span>
+        <span class="msg-bar-btns"><button class="mini-btn" data-act="edit">编辑</button><button class="mini-btn" data-act="del">删除</button></span>
       </div>`;
+    const userBar = div.querySelector('.msg-bar');
+    userBar.querySelector('[data-act=edit]').onclick = () => startEdit(index);
+    userBar.querySelector('[data-act=del]').onclick = () => {
+      if (!confirm('删除这条消息？')) return;
+      state.messages.splice(index, 1);
+      state.editing = null;
+      persist();
+      renderChat();
+    };
+    if (state.editing === index) bindEdit(div, index);
     return div;
   }
 
   const wrap = document.createElement('div');
   wrap.className = 'bubble ai-bubble';
-  const structured = parseStructuredReply(m.content || '');
+  if (state.editing === index) {
+    wrap.innerHTML = editForm(m.content);
+    div.appendChild(wrap);
+    const bar = document.createElement('div');
+    bar.className = 'msg-bar';
+    bar.innerHTML = '<span class="st"></span><span class="msg-bar-btns"><button class="mini-btn" data-act="del">删除</button></span>';
+    bar.querySelector('[data-act=del]').onclick = () => {
+      state.messages.splice(index, 1);
+      state.editing = null;
+      persist();
+      renderChat();
+    };
+    div.appendChild(bar);
+    bindEdit(div, index);
+    return div;
+  }
+
+  const structured = parseCached(m.content || '');
+  const diagnostic = m.rawContent ? parseCached(m.rawContent) : structured;
+  const unparsed = structured.unparsed.length ? structured.unparsed : diagnostic.unparsed;
   appendSceneStrip(wrap, structured.scene);
-  for (const seg of parseReply(structured.text)) {
+  if (!structured.text) {
+    const notice = document.createElement('div');
+    notice.className = 'err';
+    notice.textContent = unparsed.length
+      ? '这次没有生成可读的故事正文；下方可查看未识别的数据。'
+      : '这次回复没有生成故事正文。';
+    wrap.appendChild(notice);
+  }
+  for (const seg of (structured.text ? parseReply(structured.text) : [])) {
     if (seg.type === 'text') {
       const d = document.createElement('div');
       d.className = 'seg-text';
@@ -814,7 +991,7 @@ function bubbleFor(m) {
       ['姓名', persona?.name], ['身份', structured.player.status],
       ...Object.entries(structured.player.values || {}).map(([key, value]) => [key, displaySceneValue(value)]),
     ].filter(([, value]) => value != null && String(value).trim());
-    appendStructuredPanel(wrap, '玩家状态', rows, 'reply-player');
+    appendStructuredPanel(wrap, '本轮玩家状态（AI记录，仅供核对）', rows, 'reply-player');
   }
   if (Array.isArray(structured.characters) && structured.characters.length) {
     const rows = structured.characters.map((item) => [item.name,
@@ -859,6 +1036,22 @@ function bubbleFor(m) {
     review.innerHTML = `<summary>演绎检查</summary><div>${formatText(escapeHtml(structured.review))}</div>`;
     wrap.appendChild(review);
   }
+  if (unparsed.length) {
+    const details = document.createElement('details');
+    details.className = 'reply-review';
+    details.open = !structured.text;
+    const labels = [...new Set(unparsed.map((item) => item.name))].join('、');
+    details.innerHTML = `<summary>未识别的数据：${escapeHtml(labels)}</summary><div class="memory-content">${unparsed.map((item) =>
+      `<b>${escapeHtml(item.name)}</b><pre>${escapeHtml(item.content)}</pre>`).join('')}</div>`;
+    wrap.appendChild(details);
+  }
+  if (!structured.text && (m.rawContent || m.content)) {
+    const raw = document.createElement('details');
+    raw.className = 'reply-review';
+    raw.open = true;
+    raw.innerHTML = `<summary>模型原始回复（正文未能识别）</summary><div class="memory-content"><pre>${escapeHtml(String(m.rawContent || m.content).slice(0, 16000))}</pre></div>`;
+    wrap.appendChild(raw);
+  }
   if (structured.choices.length) {
     const choices = document.createElement('div');
     choices.className = 'reply-choices';
@@ -882,21 +1075,31 @@ function bubbleFor(m) {
   const bar = document.createElement('div');
   bar.className = 'msg-bar';
   const stats = m.stats ? `${m.stats.tps?.toFixed(1) || ''} tok/s` : '';
-  bar.innerHTML = `<span class="st"></span>`;
+  const versions = variantsOf(m);
+  const versionNav = versions.length > 1
+    ? `<span class="variant-nav"><button class="mini-btn" data-act="prev" title="上一版本">‹</button><span class="variant-count">${variantIndex(m) + 1}/${versions.length}</span><button class="mini-btn" data-act="next" title="下一版本">›</button></span>`
+    : '';
+  bar.innerHTML = `<span class="st"></span><span class="msg-bar-btns">${versionNav}<button class="mini-btn" data-act="edit">编辑</button><button class="mini-btn" data-act="regen" ${state.busy ? 'disabled' : ''}>重新生成</button><button class="mini-btn" data-act="copy">复制</button><button class="mini-btn" data-act="del">删除</button></span>`;
   bar.querySelector('.st').textContent = stats;
-  const btns = document.createElement('span');
-  btns.innerHTML = `<button class="mini-btn" data-act="copy">复制</button><button class="mini-btn" data-act="del">删除</button>`;
-  bar.appendChild(btns);
   div.appendChild(bar);
 
+  const prev = bar.querySelector('[data-act=prev]');
+  if (prev) prev.onclick = () => switchVariant(index, -1);
+  const next = bar.querySelector('[data-act=next]');
+  if (next) next.onclick = () => switchVariant(index, 1);
+  bar.querySelector('[data-act=edit]').onclick = () => startEdit(index);
+  bar.querySelector('[data-act=regen]').onclick = () => regenerate(index);
   bar.querySelector('[data-act=copy]').onclick = (ev) => {
     navigator.clipboard.writeText(m.content);
     ev.target.textContent = '已复制';
     setTimeout(() => (ev.target.textContent = '复制'), 1200);
   };
   bar.querySelector('[data-act=del]').onclick = () => {
-    state.messages = state.messages.filter((x) => x !== m);
-    persist(); renderChat();
+    state.messages.splice(index, 1);
+    state.editing = null;
+    persist();
+    renderChat();
+    renderCastBar();
   };
 
   return div;
@@ -958,12 +1161,12 @@ function scrollDown() {
 
 /* ============ 组装 + 发送 ============ */
 
-function buildPrompt(userInput) {
+function buildPrompt(userInput, history = state.messages) {
   const persona = getPersona();
   const card = getCard();
   const blocks = [...state.cfg.blocks];
   // 开场白显示在聊天区而不计入历史；首次回应前作为上下文传给模型。
-  if (state.cfg.greeting && !state.messages.some((message) => message.role === 'assistant')) {
+  if (state.cfg.greeting && !history.some((message) => message.role === 'assistant')) {
     blocks.push({ name: '开场上下文', enabled: true, order: 6,
       content: '以下是已经发生的故事开场。接续玩家当前的回应推进剧情，不要重新演出开场：\n' + state.cfg.greeting });
   }
@@ -972,25 +1175,23 @@ function buildPrompt(userInput) {
   return assemble({
     blocks,
     entries: state.cfg.entries,
-    messages: state.messages,
+    messages: history,
     userInput,
+    tokenBudget: contextBudget(),
     narrativeStyle: true,
     vars: state.cfg.vars,
     memory: state.cfg.memory,
     choices: state.cfg.choices,
     responseFormat: state.cfg.responseFormat,
     scene: state.cfg.scene,
-    playerState: state.cfg.playerState,
+    // Do not inject model-authored player emotions or intentions as established facts.
+    playerState: null,
     characters: state.cfg.characterStates,
     situation: state.cfg.situation,
     persona: persona ? personaToBlock(persona) : '',
     charName: card ? (card.name || '') : '',
     userName: persona ? (persona.name || '') : '',
   });
-}
-
-function extractStructuredReplyTags(raw) {
-  return serializeStructuredReply(parseStructuredReply(raw));
 }
 
 function compactReplyText(text) {
@@ -1108,40 +1309,48 @@ function collapseRepeatedParagraphs(text) {
   return paragraphs.join(separator || '\n\n');
 }
 
-function collapseReplyRepetitions(raw) {
-  const parsed = parseStructuredReply(raw);
-  const body = collapseRepeatedParagraphs(parsed.text);
-  const tags = extractStructuredReplyTags(raw);
-  return [body, ...tags].filter(Boolean).join('\n\n');
-}
-
 function mergeReplyContinuation(previous, continuation) {
   const before = parseStructuredReply(previous);
   const next = parseStructuredReply(continuation);
   const continuationText = removeRepeatedContinuation(before.text, collapseRepeatedParagraphs(next.text));
   const body = [before.text, continuationText].map((text) => text.trim()).filter(Boolean).join('\n\n');
-  const tags = extractStructuredReplyTags(continuation);
-  const fallbackTags = extractStructuredReplyTags(previous);
-  return [body, ...(tags.length ? tags : fallbackTags)].filter(Boolean).join('\n\n');
+  const merged = { ...before, text: body };
+  for (const key of ['scene', 'player', 'characters', 'situation', 'changes', 'state', 'memory']) {
+    merged[key] = next[key] ?? before[key];
+  }
+  if (before.state && next.state) merged.state = { ...before.state, ...next.state };
+  if (before.memory && next.memory) merged.memory = mergeMemory(before.memory, next.memory);
+  merged.choices = next.choices.length ? next.choices : before.choices;
+  merged.review = next.review || before.review;
+  merged.unparsed = [...before.unparsed, ...next.unparsed].filter((item, index, all) =>
+    all.findIndex((other) => other.name === item.name && other.content === item.content) === index);
+  return [body, ...serializeStructuredReply(merged)].filter(Boolean).join('\n\n');
 }
 
-async function send() {
+async function generateReply({ promptHistory, baseMessages, userText, variantsSource = null }) {
   if (state.busy || state.memoryBusy) return;
-  const input = $('chatInput');
-  const text = input.value.trim();
-  if (!text) return;
+  const { messages, stats } = buildPrompt(userText, promptHistory);
+  const context = {
+    version: state.contextVersion, configId: state.configId, cardId: state.cardId,
+    cfg: state.cfg, messages: baseMessages.slice(),
+  };
 
-  const { messages, stats } = buildPrompt(text);
-
-  const context = { version: state.contextVersion, configId: state.configId, cardId: state.cardId, cfg: state.cfg, messages: state.messages };
-  context.messages.push({ role: 'user', content: text });
-  input.value = '';
-  persist();
-  renderChat();
-  $('statHit').textContent = `触发 ${stats.entriesHit}/${stats.entriesTotal}`;
-
+  const beforeMessages = state.messages.slice();
+  state.messages = baseMessages.slice();
+  state.editing = null;
   state.busy = true;
+  const controller = new AbortController();
+  state.abortController = controller;
   $('sendBtn').disabled = true;
+  if ($('stopBtn')) $('stopBtn').hidden = false;
+  const trimNote = stats.trimmed
+    ? ` · 裁剪历史 ${stats.trimmed.historyMessages} 条 / 世界书 ${stats.trimmed.worldbookEntries} 条`
+    : '';
+  $('statHit').textContent = `触发 ${stats.entriesHit}/${stats.entriesTotal} · 约 ${formatTokenCount(stats.tokens)} tokens${trimNote}`;
+  // 重新生成时先不落盘：失败或取消时旧回复仍在存储里。
+  if (!variantsSource) persist();
+  renderChat();
+  scrollDown();
 
   const div = document.createElement('div');
   div.className = 'msg assistant';
@@ -1152,14 +1361,30 @@ async function send() {
   const t0 = performance.now();
 
   let full = '';
+  let lastPaint = 0;
+  const paint = (text, force = false) => {
+    const now = performance.now();
+    if (!force && now - lastPaint < 80) return;
+    lastPaint = now;
+    if (context.version !== state.contextVersion) return;
+    bubbleEl.innerHTML = formatText(escapeHtml(text)) + '<span class="cursor"></span>';
+    scrollDown();
+  };
+
+  let aborted = false;
+  let failure = null;
+  const finish = () => {
+    state.busy = false;
+    state.abortController = null;
+    $('sendBtn').disabled = false;
+    if ($('stopBtn')) $('stopBtn').hidden = true;
+  };
   try {
+    // 流式期间只做轻量可见文本提取，避免每个 chunk 全文解析 + 全文重写。
     await llm.stream(messages, (delta, acc) => {
-      full = collapseReplyRepetitions(acc);
-      if (context.version === state.contextVersion) {
-        bubbleEl.innerHTML = formatText(escapeHtml(parseStructuredReply(full).text));
-        scrollDown();
-      }
-    }, genOpts());
+      full = acc;
+      paint(streamingVisibleText(full));
+    }, { ...genOpts(), signal: controller.signal });
 
     // Continue short generations into the fixed v3 body range.
     const target = getBodyTarget(context.cfg);
@@ -1169,7 +1394,9 @@ async function send() {
       const currentLength = getBodyLength(parsed.text);
       if (currentLength >= target) break;
 
-      const continuationInput = `【正文补写】当前正文为${currentLength}字，目标范围为1000-2000字，目标约${TARGET_BODY_CHARS}字。请从上一段末尾继续，不重写或重复前文；补充角色反应、环境、感官、心理、对白和事件推进，并在达到目标范围后输出最终结构化数据。总正文不要超过${MAX_BODY_CHARS}字。玩家描写仍最多占正文10%，不得替玩家新增关键决定、意图、立场、目标、同意或核心行动。`;
+      const continuationInput = currentLength === 0
+        ? '【正文缺失修复】上一轮只返回了结构化标签或代码，没有故事正文。请根据当前故事上下文直接生成连续的小说正文，至少1000字；不要输出 JSON、Scene/Player/Characters/Memory 等标签、代码围栏或解释。聚焦非玩家角色和环境，不替玩家编造心理、欲望、同意或行动；不要自行引入用户未要求的性暗示或关系升级。'
+        : `【正文补写】当前正文为${currentLength}字，目标范围为1000-2000字，目标约${TARGET_BODY_CHARS}字。请从上一段末尾继续，不重写或重复前文；补充角色反应、环境、感官、心理、对白和事件推进，并在达到目标范围后输出最终结构化数据。总正文不要超过${MAX_BODY_CHARS}字。玩家描写仍最多占正文10%，不得替玩家新增关键决定、意图、立场、目标、同意或核心行动。`;
       const continuationMessages = [
         ...messages,
         { role: 'assistant', content: `【上一段正文末尾】\n${parsed.text.slice(-1600)}` },
@@ -1177,45 +1404,96 @@ async function send() {
       ];
       let continuation = '';
       await llm.stream(continuationMessages, (delta, acc) => {
-        continuation = collapseReplyRepetitions(acc);
-        const merged = mergeReplyContinuation(full, acc);
-        if (context.version === state.contextVersion) {
-          bubbleEl.innerHTML = formatText(escapeHtml(parseStructuredReply(merged).text));
-          scrollDown();
-        }
-      }, genOpts());
+        continuation = acc;
+        const visible = [streamingVisibleText(full), streamingVisibleText(continuation)].filter(Boolean).join('\n\n');
+        paint(visible);
+      }, { ...genOpts(), signal: controller.signal });
       const merged = mergeReplyContinuation(full, continuation);
       if (getBodyLength(parseStructuredReply(merged).text) <= currentLength) break;
       full = merged;
       continuationCount += 1;
     }
+  } catch (err) {
+    if (err?.name === 'AbortError') aborted = true;
+    else failure = err;
+  }
 
-    const dt = (performance.now() - t0) / 1000;
-    applyStructuredReplyToConfig(full, context.cfg);
-    context.messages.push({
-      role: 'assistant',
-      content: full,
-      stats: { tps: dt > 0 ? (full.length / 1.5) / dt : 0, tokens: Math.round(full.length / 1.5) },
-    });
-    persistConversation(context);
+  const dt = (performance.now() - t0) / 1000;
+  const parsedReply = parseStructuredReply(full);
+  const bodyLength = getBodyLength(parsedReply.text);
+
+  if (failure) {
+    finish();
     if (context.version === state.contextVersion) {
+      bubbleEl.innerHTML = `<div class="err">出错了：${escapeHtml(failure.message)}</div>`;
+      if (variantsSource) {
+        state.messages = beforeMessages;
+        renderChat();
+        $('statHit').textContent = '生成失败，已保留原回复';
+      }
+    }
+    console.error(failure);
+  } else if (aborted && !bodyLength) {
+    finish();
+    // 完全没产出内容时，撤掉空气泡并恢复原消息列表。
+    if (context.version === state.contextVersion) {
+      state.messages = variantsSource ? beforeMessages : baseMessages.slice();
+      renderChat();
+      $('statHit').textContent = '已停止生成';
+    }
+  } else {
+    applyStructuredReplyToConfig(full, context.cfg);
+    const canonicalReply = [collapseRepeatedParagraphs(parsedReply.text), ...serializeStructuredReply({ ...parsedReply, unparsed: [] })]
+      .filter(Boolean).join('\n\n');
+    let assistant = {
+      role: 'assistant',
+      content: canonicalReply,
+      ...((parsedReply.unparsed.length || !parsedReply.text) ? { rawContent: full } : {}),
+      stats: { tps: dt > 0 ? (full.length / 1.5) / dt : 0, tokens: Math.round(full.length / 1.5) },
+    };
+    if (variantsSource) {
+      assistant = withVariant({ ...variantsSource }, canonicalReply);
+      assistant.stats = { tps: dt > 0 ? (full.length / 1.5) / dt : 0, tokens: Math.round(full.length / 1.5) };
+      if (parsedReply.unparsed.length || !parsedReply.text) assistant.rawContent = full;
+      else delete assistant.rawContent;
+    }
+    context.messages.push(assistant);
+    persistConversation(context);
+    // 先结束忙碌状态再渲染，否则消息栏里的「重新生成」会保持在禁用态。
+    finish();
+    if (context.version === state.contextVersion) {
+      state.messages = context.messages;
       renderStatePanel();
       renderMemory();
       renderChat();
       renderCastBar();
       maybeAutoSummarize();
+      if (aborted) $('statHit').textContent = '已停止生成，保留已写出的部分';
     }
-  } catch (err) {
-    if (context.version === state.contextVersion) bubbleEl.innerHTML = `<div class="err">出错了：${escapeHtml(err.message)}</div>`;
-    console.error(err);
-  } finally {
-    state.busy = false;
-    $('sendBtn').disabled = false;
-    input.focus();
   }
+
+  finish();
+  $('chatInput').focus();
+}
+
+async function send() {
+  if (state.busy || state.memoryBusy) return;
+  flushPersist();
+  const input = $('chatInput');
+  const text = input.value.trim();
+  if (!text) return;
+
+  input.value = '';
+  const promptHistory = state.messages.slice();
+  const baseMessages = [...state.messages, { role: 'user', content: text }];
+  await generateReply({ promptHistory, baseMessages, userText: text });
 }
 
 /* ============ 预览组装结果 ============ */
+const CTX_LABELS = {
+  blocks: '设定块', persona: '玩家身份', worldbook: '世界书', history: '历史', input: '本轮输入', other: '协议与其他',
+};
+
 function previewPrompt() {
   const { messages, stats } = buildPrompt('（这里是本轮将发送的内容）');
 
@@ -1228,21 +1506,47 @@ function previewPrompt() {
   }).join('');
 
   $('previewBox').innerHTML = html;
+  const budget = contextBudget();
+  const percent = budget ? Math.min(100, Math.round((stats.tokens / budget) * 100)) : 0;
+  const trimmed = stats.trimmed
+    ? ` · 已裁剪历史 ${stats.trimmed.historyMessages} 条 / 世界书 ${stats.trimmed.worldbookEntries} 条`
+    : '';
   $('previewStat').textContent =
-    `${messages.length} 条消息 · 约 ${LLM.estimateTokens(messages)} tokens · 世界书触发 ${stats.entriesHit}/${stats.entriesTotal}` +
-    `（提示词 ${stats.byScope.prompt} / 前置 ${stats.byScope.prepend} / 后置 ${stats.byScope.append}）`;
+    `${messages.length} 条消息 · 约 ${stats.tokens} tokens${budget ? ` / ${budget}（${percent}%）` : ''}` +
+    ` · 世界书触发 ${stats.entriesHit}/${stats.entriesTotal}` +
+    `（提示词 ${stats.byScope.prompt} / 前置 ${stats.byScope.prepend} / 后置 ${stats.byScope.append}）${trimmed}`;
+
+  const meter = $('contextMeter');
+  if (!meter) return;
+  const sections = Object.entries(stats.sections || {})
+    .filter(([, value]) => value > 0)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5);
+  meter.className = 'ctx-meter ' + (stats.overBudget ? 'over' : percent >= 85 ? 'warn' : 'ok');
+  meter.innerHTML = `
+    <div class="ctx-head"><span>上下文占用</span><span>${formatTokenCount(stats.tokens)}${budget ? ' / ' + formatTokenCount(budget) : '（未限制）'}</span></div>
+    <div class="ctx-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><i style="width:${percent}%"></i></div>
+    <div class="ctx-sections">${sections.map(([name, value]) =>
+      `<span>${CTX_LABELS[name] || name} ${formatTokenCount(value)}</span>`).join('')}</div>
+    ${stats.overBudget ? '<div class="ctx-note bad">已裁到最小仍超出预算：请缩短设定或记忆，或调低输出预算。</div>' : ''}`;
 }
 
 /* ============ 事件绑定 ============ */
 function bindEvents() {
   $('sendBtn').onclick = send;
+  if ($('stopBtn')) $('stopBtn').onclick = () => { state.abortController?.abort(); };
   $('chatInput').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       send();
     }
   });
-  $('chatInput').addEventListener('input', previewPrompt);
+  // 预览需要完整组装一次，输入时合并到 180ms 后再算。
+  let previewTimer = 0;
+  $('chatInput').addEventListener('input', () => {
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(previewPrompt, 180);
+  });
 
   $('newBtn').onclick = () => {
     if (state.busy || state.memoryBusy) { alert('请等当前回复或记忆整理完成后再新建作品'); return; }
@@ -1255,7 +1559,7 @@ function bindEvents() {
   $('cfgName').oninput = (e) => {
     state.cfg.name = e.target.value;
     $('chatTitle').textContent = e.target.value;
-    persist(); renderConfigList();
+    persistSoon(); renderConfigList();
   };
 
   $('personaChip').onclick = () => {
@@ -1292,7 +1596,7 @@ function bindEvents() {
     persist(); renderVars();
   };
   $('varsPrompt').oninput = (e) => {
-    state.cfg.vars.prompt = e.target.value; persist();
+    state.cfg.vars.prompt = e.target.value; persistSoon();
   };
   $('varsHistory').onchange = (e) => {
     state.cfg.vars.historyLimit = parseInt(e.target.value) || 20; persist();
@@ -1305,12 +1609,12 @@ function bindEvents() {
   if ($('memoryMarkdown')) $('memoryMarkdown').oninput = (e) => {
     const parsed = parseMemoryMarkdown(e.target.value);
     state.cfg.memory = normalizeMemory({ ...(state.cfg.memory || {}), ...parsed, markdown: e.target.value });
-    persist(); previewPrompt();
+    persistSoon(); previewPrompt();
   };
   // 旧页面缓存仍可能保留摘要输入框，继续同步它，避免升级过程中丢失手工内容。
   if ($('memorySummary')) $('memorySummary').oninput = (e) => {
     state.cfg.memory = normalizeMemory({ ...(state.cfg.memory || {}), summary: e.target.value });
-    persist(); previewPrompt();
+    persistSoon(); previewPrompt();
   };
   $('memoryThreshold').onchange = (e) => {
     state.cfg.memory = state.cfg.memory || {};
@@ -1339,7 +1643,13 @@ function bindEvents() {
     persist(); previewPrompt();
   };
   $('greetingBox').oninput = (e) => {
-    state.cfg.greeting = e.target.value; persist();
+    state.cfg.greeting = e.target.value; persistSoon();
+  };
+  if ($('contextBudget')) $('contextBudget').onchange = (e) => {
+    const value = Math.max(0, Math.min(65536, parseInt(e.target.value, 10) || 0));
+    state.cfg.contextBudget = value;
+    e.target.value = value;
+    persist(); previewPrompt();
   };
 
   $('refreshBtn').onclick = checkHealth;
@@ -1352,6 +1662,7 @@ function bindEvents() {
   $('refreshPreview').onclick = previewPrompt;
 
   $('exportBtn').onclick = () => {
+    flushPersist();
     const blob = new Blob([exportConfig(state.cfg)], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -1359,6 +1670,7 @@ function bindEvents() {
     a.click();
   };
   $('backupExportBtn').onclick = () => {
+    flushPersist();
     const blob = new Blob([store.exportWorkspaceBackup()], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -1369,6 +1681,7 @@ function bindEvents() {
   $('backupFile').onchange = (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    flushPersist();
     const reader = new FileReader();
     reader.onload = () => {
       try {
@@ -1388,10 +1701,14 @@ function bindEvents() {
   $('importFile').onchange = (e) => {
     const f = e.target.files[0];
     if (!f) return;
+    flushPersist();
     const reader = new FileReader();
     reader.onload = () => {
       try {
         state.cfg = importConfig(reader.result);
+        if (!Number.isFinite(Number(state.cfg.contextBudget)) || Number(state.cfg.contextBudget) < 0) {
+          state.cfg.contextBudget = DEFAULT_CONTEXT_BUDGET;
+        }
         state.messages = [];
         store.saveConfig(state.configId, state.cfg);
         persist(); renderBlocks(); renderEntries(); renderVars(); renderCastBar(); renderChat();

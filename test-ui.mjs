@@ -316,7 +316,10 @@ console.log('\n=== 9. 变量面板状态解析 ===');
   check('结构化回复提取检查和选项', structured.review.includes('人物行为') && structured.choices.length === 4);
   check('结构化标签从正文移除', !structured.text.includes('<Scene>') && structured.text.includes('继续走吧'));
   const malformed = parseStructuredReply('正文\n<Scene>{bad}</Scene>');
-  check('坏 Scene 标签不吞正文', malformed.text.includes('正文') && malformed.text.includes('<Scene>'));
+  check('坏 Scene 数据从正文隔离并可查看', malformed.text === '正文' && malformed.unparsed[0]?.name === 'Scene');
+
+  const codeOnly = parseStructuredReply('Scene\n时间：深夜\nPlayer\n{bad}');
+  check('无尖括号结构标签被隔离出正文', codeOnly.text === '' && codeOnly.scene?.time === '深夜' && codeOnly.unparsed.length === 1);
 
   const rich = parseStructuredReply([
     '环境描写',

@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>叙境 StoryRealm · v3.0.5</title>
+<title>叙境 StoryRealm · v3.1.0</title>
 <meta name="description" content="叙境 StoryRealm：连接本地模型的互动小说与角色创作平台。AI 辅助构思世界、人物和开场，由你决定故事走向。">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="css/style.css?v=20261018-v3.0.5">
+<link rel="stylesheet" href="css/style.css?v=20261018-v3.1.0">
 </head>
 <body>
 
@@ -14,7 +14,7 @@
 <header class="topbar">
   <div class="tb-left">
     <span class="logo">◆</span>
-    <span class="app-brand">叙境 <span class="app-version">v3.0.4</span></span>
+    <span class="app-brand">叙境 <span class="app-version">v3.1.0</span></span>
     <span id="chatTitle" class="tb-title">作品</span>
   </div>
   <div class="tb-right">
@@ -53,6 +53,7 @@
         <button id="clearChat" class="mini-btn">清空对话</button>
         <div class="comp-right">
           <button id="personaChip" class="persona-chip"></button>
+          <button id="stopBtn" class="mini-btn stop-btn" hidden>停止</button>
           <button id="sendBtn" class="send-btn">发送</button>
         </div>
       </div>
@@ -87,7 +88,7 @@
       <!-- AI 创作入口 -->
       <div class="ai-create">
         <label class="mini">你想要个什么样的角色？</label>
-        <textarea id="aiBrief" rows="2" placeholder="例如：会武功的.library员，表面冷漠其实很护短"></textarea>
+        <textarea id="aiBrief" rows="2" placeholder="例如：会武功的图书管理员，表面冷漠其实很护短"></textarea>
         <div class="btn-row">
           <button id="aiDirBtn" class="mini-btn primary">AI 生成方向</button>
           <button id="aiExpandBtn" class="mini-btn" disabled>展开选中方向</button>
@@ -175,6 +176,11 @@
         <label class="chk"><input id="formatReview" type="checkbox">显示简短演绎检查</label>
       </div>
 
+      <hr>
+      <label class="mini" for="contextBudget">输入上下文预算（token，0 表示不限制）</label>
+      <input id="contextBudget" class="cf-in" type="number" min="0" max="65536" step="512" value="7000">
+      <div class="pane-hint">预算只计算发送给模型的输入，不含回复输出；超出时先丢弃最旧的对话，再按顺序丢弃低优先级的世界书条目。场景、记忆和回复协议不会被裁剪。</div>
+
       <label class="mini">开场白（进入聊天时的第一段）</label>
       <textarea id="greetingBox" rows="5" placeholder="像小说一样直接描写动作与神态，台词使用中文双引号“”"></textarea>
 
@@ -200,6 +206,7 @@
       <div class="btn-row">
         <button id="refreshPreview" class="mini-btn">刷新预览</button>
       </div>
+      <div id="contextMeter" class="ctx-meter"></div>
       <div id="previewStat" class="pv-stat"></div>
       <div id="previewBox" class="preview-box"></div>
     </div>
@@ -214,25 +221,27 @@
 <script type="importmap">
 {
   "imports": {
-    "./js/assembler.js": "./js/assembler.js?v=20261018-v3.0.5",
-    "./js/card-panel.js": "./js/card-panel.js?v=20261018-v3.0.5",
-    "./js/card.js": "./js/card.js?v=20261018-v3.0.5",
-    "./js/json-utils.js": "./js/json-utils.js?v=20261018-v3.0.5",
-    "./js/llm.js": "./js/llm.js?v=20261018-v3.0.5",
-    "./js/memory.js": "./js/memory.js?v=20261018-v3.0.5",
-    "./js/main.js": "./js/main.js?v=20261018-v3.0.5",
-    "./js/narrative.js": "./js/narrative.js?v=20261018-v3.0.5",
-    "./js/persona.js": "./js/persona.js?v=20261018-v3.0.5",
-    "./js/profile-assist.js": "./js/profile-assist.js?v=20261018-v3.0.5",
-    "./js/profile.js": "./js/profile.js?v=20261018-v3.0.5",
-    "./js/prompts.js": "./js/prompts.js?v=20261018-v3.0.5",
-    "./js/render.js": "./js/render.js?v=20261018-v3.0.5",
-    "./js/store.js": "./js/store.js?v=20261018-v3.0.5",
-    "./js/story-creator-panel.js": "./js/story-creator-panel.js?v=20261018-v3.0.5",
-    "./js/story-creator.js": "./js/story-creator.js?v=20261018-v3.0.5"
+    "./js/assembler.js": "./js/assembler.js?v=20261018-v3.1.0",
+    "./js/card-panel.js": "./js/card-panel.js?v=20261018-v3.1.0",
+    "./js/card.js": "./js/card.js?v=20261018-v3.1.0",
+    "./js/json-utils.js": "./js/json-utils.js?v=20261018-v3.1.0",
+    "./js/llm.js": "./js/llm.js?v=20261018-v3.1.0",
+    "./js/main.js": "./js/main.js?v=20261018-v3.1.0",
+    "./js/memory.js": "./js/memory.js?v=20261018-v3.1.0",
+    "./js/message-actions.js": "./js/message-actions.js?v=20261018-v3.1.0",
+    "./js/narrative.js": "./js/narrative.js?v=20261018-v3.1.0",
+    "./js/persona.js": "./js/persona.js?v=20261018-v3.1.0",
+    "./js/profile-assist.js": "./js/profile-assist.js?v=20261018-v3.1.0",
+    "./js/profile.js": "./js/profile.js?v=20261018-v3.1.0",
+    "./js/prompts.js": "./js/prompts.js?v=20261018-v3.1.0",
+    "./js/render.js": "./js/render.js?v=20261018-v3.1.0",
+    "./js/store.js": "./js/store.js?v=20261018-v3.1.0",
+    "./js/story-creator-panel.js": "./js/story-creator-panel.js?v=20261018-v3.1.0",
+    "./js/story-creator.js": "./js/story-creator.js?v=20261018-v3.1.0",
+    "./js/tokens.js": "./js/tokens.js?v=20261018-v3.1.0"
   }
 }
 </script>
-<script type="module" src="js/main.js?v=20261018-v3.0.5"></script>
+<script type="module" src="js/main.js?v=20261018-v3.1.0"></script>
 </body>
 </html>

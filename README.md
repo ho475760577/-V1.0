@@ -1,4 +1,4 @@
-# 叙境 StoryRealm · v3.0.5
+# 叙境 StoryRealm · v3.1.0
 
 **让一个想法，成为可以走进去的故事。**
 
@@ -8,10 +8,13 @@
 - 世界书、Markdown 剧情记忆、场景状态和四个可选行动建议。
 - 角色目标、恐惧、需求、矛盾、边界、行为线索与人物弧光。
 - 小说式正文固定为 1000–2000 字，目标约 1400 字；篇幅档位已移除。
+- 流式回复按 80ms 节流渲染，生成中可随时停止并保留已写出的正文。
+- 消息支持内联编辑、重新生成与多版本切换；重新生成保留旧版本。
+- 输入上下文预算默认 7000 token，超出时先裁剪最旧历史，再丢弃低优先级世界书条目；调试页可查看分块占用。
 - 原生 HTML / CSS / JavaScript，无前端构建步骤。
 - 作品和聊天即时保存在当前浏览器，并在使用一键启动脚本时自动同步到项目 `data/storyrealm-workspace.json`；连接本地模型时可离线使用。
 
-当前版本 **3.0.5**，界面标注为 **v3.0.5**。更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本 **3.1.0**，界面标注为 **v3.1.0**。更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 快速开始
 
@@ -160,12 +163,14 @@ storyrealm/
 │   ├── render.js       Reply Example 解析 + 安全渲染
 │   ├── store.js        localStorage 持久化
 │   ├── main.js         主界面与聊天逻辑
+│   ├── tokens.js       token 估算与上下文预算辅助
+│   ├── message-actions.js  消息编辑、重新生成与多版本
 │   ├── card.js / card-panel.js   角色卡与 AI 创作
 │   ├── persona.js / profile.js / profile-assist.js   玩家与人物资料
 │   ├── story-creator.js / story-creator-panel.js    新作品向导
 │   └── prompts.js / narrative.js / json-utils.js   篇幅、写作规则与解析
 ├── test-*.mjs          StoryRealm v3 自动回归
-├── VERSION             正式版本号 3.0.0
+├── VERSION             正式版本号 3.1.0
 ├── CHANGELOG.md        版本更新记录
 ├── start.local.example.bat  本机路径配置示例
 └── start.bat           Windows 一键启动
@@ -181,9 +186,13 @@ node test-profile.mjs
 node test-profile-ai.mjs
 node test-module-loading.mjs
 node test-story-creator.mjs
+node test-memory.mjs
+node test-persistence.mjs
+node test-llm.mjs
+node test-optimizations.mjs
 ```
 
-自动回归覆盖组装与世界书条件、角色与身份、固定回复格式、AI 美化、模块缓存、新作品创建、完整备份恢复和流式思考过滤。自测使用模拟模型与内存存储，不需要下载模型，不访问用户浏览器资料。
+自动回归覆盖组装与世界书条件、角色与身份、固定回复格式、AI 美化、模块缓存、新作品创建、完整备份恢复、流式思考过滤、上下文预算与消息版本。自测使用模拟模型与内存存储，不需要下载模型，不访问用户浏览器资料。
 
 ## 重要：thinking 模型
 
@@ -438,6 +447,12 @@ function chatKey(configId, cardId) {
 ## 固定正文要求
 
 每轮正文目标为 1000–2000 字，默认瞄准约 1400 字。长度统计排除思维链和 Scene、Player、Characters、Situation、Changes、State、Memory、Choices 等结构化内容。正文偏短时前端最多续写三次；本地模型、上下文窗口与生成上限仍会影响最终篇幅，不能保证所有模型都达到目标。
+
+## 上下文预算与生成控制
+
+「其他」Tab 的输入上下文预算默认 7000 token，只统计发送给模型的输入，不包含回复输出；设为 0 可恢复不限制。超出预算时先成对丢弃最旧的历史消息，仍超出再按 `order` 从低到高丢弃提示词域世界书条目；设定块、玩家身份、场景、记忆与回复协议不会被裁剪。调试 Tab 会显示总量、占用条和主要分块的估算。
+
+生成期间点击「停止」可中断请求；已经写出的正文会保留为正常消息。每条 AI 消息支持内联编辑、重新生成和 `‹ 1/2 ›` 版本切换。重新生成会保留旧版本；编辑会以手写内容为准并清除该条消息的旧版本。
 
 ## 设计参考与许可证
 

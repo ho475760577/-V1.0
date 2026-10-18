@@ -408,6 +408,7 @@ hr { border: none; border-top: 1px solid var(--line); margin: 18px 0; }
 }
 .reply-memory summary, .reply-review summary { cursor: pointer; color: var(--tx-3); }
 .memory-content { margin-top: 5px; }
+.memory-content pre { margin: 5px 0 10px; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; color: var(--tx-2); }
 .reply-changes { margin-top: 10px; padding: 7px 9px; border: 1px solid rgba(74, 222, 128, .2); border-radius: 6px; background: rgba(74, 222, 128, .04); color: var(--tx-2); font-size: 11px; line-height: 1.6; }
 .reply-changes summary { cursor: pointer; color: #83c98f; }
 .changes-content { margin-top: 5px; }
@@ -509,3 +510,28 @@ hr { border: none; border-top: 1px solid var(--line); margin: 18px 0; }
 .p-av-row .card-sel { flex: 1; min-width: 90px; }
 
 #pEditor > .add-btn { margin-top: 6px; }
+
+/* ============ v3.1.0 交互增强 ============ */
+.stop-btn { border-color: rgba(239,100,97,.5); color: var(--bad); }
+.stop-btn:hover { background: rgba(239,100,97,.12); }
+.msg-bar-btns { display: flex; gap: 6px; align-items: center; margin-left: auto; flex-wrap: wrap; }
+.msg-bar .mini-btn { font-size: 11px; padding: 3px 7px; }
+.variant-nav { display: inline-flex; align-items: center; gap: 4px; }
+.variant-nav .mini-btn { padding: 2px 7px; line-height: 1.2; }
+.variant-count { font-size: 11px; color: var(--tx-3); min-width: 30px; text-align: center; }
+.msg-edit { width: 100%; }
+.msg-edit textarea { width: 100%; min-height: 120px; }
+.msg-edit .btn-row { margin-top: 8px; justify-content: flex-end; }
+.ctx-meter {
+  margin: 8px 0 10px; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 8px;
+  background: rgba(255,255,255,.03);
+}
+.ctx-head { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--tx-2); margin-bottom: 6px; }
+.ctx-bar { height: 6px; border-radius: 3px; background: rgba(255,255,255,.08); overflow: hidden; }
+.ctx-bar i { display: block; height: 100%; width: 0; background: var(--good); transition: width .2s ease; }
+.ctx-meter.warn .ctx-bar i { background: #e0b341; }
+.ctx-meter.over .ctx-bar i { background: var(--bad); }
+.ctx-sections { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 7px; font-size: 10.5px; color: var(--tx-3); }
+.ctx-note { margin-top: 6px; font-size: 11px; }
+.ctx-note.bad { color: var(--bad); }

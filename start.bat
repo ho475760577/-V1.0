@@ -1,10 +1,10 @@
 @echo off
 setlocal EnableExtensions
-title StoryRealm v3.0.3
+title StoryRealm v3.1.0
 
 set "APP_DIR=%~dp0"
 set "LLAMA_DIR=%APP_DIR%runtime\llama-cpp"
-set "MODEL=D:\SI\Models\gemma-4-12B Q4_K_M\gemma4-e4b-mahou-nsfw.i1-Q4_K_M.gguf"
+set "MODEL=%APP_DIR%models\model.gguf"
 if exist "%APP_DIR%start.local.bat" call "%APP_DIR%start.local.bat"
 if not defined LLAMA_CTX set "LLAMA_CTX=12288"
 set "LLAMA_EXE=%LLAMA_DIR%\llama-server.exe"
@@ -12,7 +12,7 @@ set "LLAMA_URL=http://127.0.0.1:8080/health"
 set "WEB_URL=http://127.0.0.1:5173"
 
 echo ========================================
-echo   StoryRealm v3.0.3 - Start All
+echo   StoryRealm v3.1.0 - Start All
 echo ========================================
 echo.
 

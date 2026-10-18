@@ -42,9 +42,38 @@ function normalizeStructuredTags(raw) {
     .replace(new RegExp(`&lt;\\s*(/\\s*(?:${names})|(?:${names}))\\s*&gt;`, 'gi'), '<$1>')
     .replace(new RegExp(`<channel\\|>\\s*(${names})\\b`, 'gi'), '<$1>')
     .replace(new RegExp(`<\\|channel\\|?>\\s*(${names})\\b`, 'gi'), '<$1>')
-    .replace(new RegExp(`(^|[\\r\\n])\\s*((?:${names}))\\s*(?:&gt;|&#62;|&#x3e;)`, 'gi'), '$1<$2>');
+    .replace(new RegExp(`(^|[\\r\\n])\\s*(?:#{1,3}\\s*)?((?:${names}))\\s*(?:&gt;|&#62;|&#x3e;)`, 'gi'), '$1<$2>');
+  source = source
+    .replace(/^\s*```(?:json|text|markdown)?\s*$/gim, '')
+    .replace(new RegExp(`(^|[\\r\\n])\\s*(?:#{1,3}\\s*)?(${names})\\s*[:：]?\\s*(?=[\\r\\n]|$)`, 'gi'), '$1<$2>');
+  source = closeLooseSceneBlock(source);
   source = closeUnterminatedStructuredTags(source);
   return source;
+}
+
+function closeLooseSceneBlock(source) {
+  const opening = /<Scene>(?!\s*[\[{])/i.exec(source);
+  if (!opening || /<\/Scene>/i.test(source.slice(opening.index))) return source;
+  const start = opening.index + opening[0].length;
+  const tail = source.slice(start);
+  let consumed = 0;
+  let foundField = false;
+  for (const match of tail.matchAll(/[^\r\n]*(?:\r?\n|$)/g)) {
+    const line = match[0];
+    if (!line.trim()) {
+      consumed += line.length;
+      continue;
+    }
+    if (/^(?:["']?[\w\u4e00-\u9fff]+["']?\s*[:：]\s*.+|[{}\[\],].*)$/.test(line.trim())) {
+      foundField = true;
+      consumed += line.length;
+      continue;
+    }
+    break;
+  }
+  if (!foundField) return source;
+  const insertAt = start + Math.min(consumed, tail.length);
+  return source.slice(0, insertAt) + '</Scene>' + source.slice(insertAt);
 }
 
 function closeUnterminatedStructuredTags(source) {
@@ -74,6 +103,18 @@ function closeUnterminatedStructuredTags(source) {
     const nextTag = tail.search(/<(?:Scene|Player|Characters|Situation|State|Changes|Memory|Choices|Review)>/i);
     const end = nextTag >= 0 ? match.index + match[0].length + nextTag : source.length;
     source = source.slice(0, end) + '</Memory>' + source.slice(end);
+  }
+
+  const anyOpening = new RegExp(`<(${STRUCTURED_TAG_NAMES})>(?![\\s\\S]*?<\\/\\1>)`, 'gi');
+  const openings = [...source.matchAll(anyOpening)];
+  for (let index = openings.length - 1; index >= 0; index -= 1) {
+    const match = openings[index];
+    const tail = source.slice(match.index + match[0].length);
+    const nextTag = tail.search(/<(?:Scene|Player|Characters|Situation|State|Changes|Memory|Choices|Review)>/i);
+    const paragraphEnd = tail.search(/\r?\n\s*\r?\n/);
+    const boundary = [nextTag, paragraphEnd].filter((index) => index >= 0).sort((a, b) => a - b)[0];
+    const end = boundary >= 0 ? match.index + match[0].length + boundary : source.length;
+    source = source.slice(0, end) + `</${match[1]}>` + source.slice(end);
   }
   return source;
 }
@@ -173,6 +214,30 @@ function parseTaggedJson(raw, regex, fallback = null) {
 /** 解析时间、世界和地点，并从正文移除 Scene 标签。 */
 export function parseScene(raw) {
   const parsed = parseTaggedJson(raw, SCENE_RE);
+  if (!parsed.value) {
+    const source = String(raw || '');
+    SCENE_RE.lastIndex = 0;
+    const blocks = [...source.matchAll(SCENE_RE)];
+    const loose = {};
+    const labels = new Map([
+      ['time', 'time'], ['时间', 'time'], ['world', 'world'], ['世界', 'world'],
+      ['location', 'location'], ['地点', 'location'], ['场所', 'location'], ['plot', 'plot'], ['情节', 'plot'],
+      ['weather', 'weather'], ['天气', 'weather'], ['atmosphere', 'atmosphere'], ['氛围', 'atmosphere'],
+      ['lighting', 'lighting'], ['光线', 'lighting'], ['goal', 'goal'], ['目标', 'goal'],
+      ['conflict', 'conflict'], ['冲突', 'conflict'], ['tension', 'tension'], ['紧张度', 'tension'],
+    ]);
+    for (const block of blocks) {
+      for (const line of block[1].split(/\r?\n/)) {
+        const field = line.trim().match(/^([\w\u4e00-\u9fff]+)\s*[:：]\s*(.+)$/);
+        if (!field) continue;
+        const key = labels.get(field[1].toLowerCase());
+        if (key) loose[key] = field[2].trim();
+      }
+    }
+    const text = loose.time || loose.world || loose.location || loose.plot
+      ? source.replace(SCENE_RE, '').trim() : parsed.text;
+    return { text, value: normalizeScene(Object.keys(loose).length ? loose : null) };
+  }
   return { ...parsed, value: normalizeScene(parsed.value) };
 }
 
@@ -339,8 +404,14 @@ export function parseStructuredReply(raw) {
   const changes = parseChanges(memory.text);
   const choices = parseChoices(changes.text);
   const review = parseReview(choices.text);
+  const unparsed = [];
+  const unresolvedTag = new RegExp(`<(${STRUCTURED_TAG_NAMES})>([\\s\\S]*?)<\\/\\1>`, 'gi');
+  let visibleText = review.text.replace(unresolvedTag, (_block, name, content) => {
+    unparsed.push({ name, content: content.trim() });
+    return '';
+  }).trim();
   return {
-    text: review.text,
+    text: visibleText,
     scene: scene.value,
     player: player.value,
     characters: characters.value,
@@ -350,6 +421,7 @@ export function parseStructuredReply(raw) {
     memory: memory.value,
     choices: choices.choices,
     review: review.review,
+    unparsed,
   };
 }
 
@@ -360,13 +432,15 @@ export function serializeStructuredReply(parsed) {
     ['Situation', parsed.situation], ['Changes', parsed.changes], ['State', parsed.state],
     ['Memory', parsed.memory], ['Choices', parsed.choices], ['Review', parsed.review],
   ];
-  return blocks.filter(([, value]) => value != null).map(([name, value]) => {
+  const serialized = blocks.filter(([, value]) => value != null && value !== '' && (!Array.isArray(value) || value.length)).map(([name, value]) => {
     const content = name === 'Review' ? String(value)
       : name === 'Memory' && value && typeof value === 'object' && value.markdown
         ? String(value.markdown)
         : JSON.stringify(value);
     return `<${name}>${content}</${name}>`;
   });
+  serialized.push(...(parsed.unparsed || []).map(({ name, content }) => `<${name}>${content}</${name}>`));
+  return serialized;
 }
 
 /** 从模型回复中提取可选行动，并从可见正文移除 Choices 标签。 */
@@ -509,8 +583,15 @@ export function buildPanelFrame(code) {
   iframe.setAttribute('sandbox', 'allow-same-origin');
   iframe.setAttribute('srcdoc', buildSrcdoc(code));
   iframe.style.cssText =
-    'width:100%;height:220px;border:none;border-radius:10px;background:transparent;display:block';
+    'width:100%;height:120px;border:none;border-radius:10px;background:transparent;display:block';
   iframe.setAttribute('title', '回复面板');
+  // srcdoc 与主页面同源，可在不启用脚本的前提下读取内容高度并自适应。
+  iframe.addEventListener('load', () => {
+    try {
+      const height = iframe.contentDocument?.body?.scrollHeight || 0;
+      if (height > 0) iframe.style.height = Math.min(640, Math.max(96, height + 8)) + 'px';
+    } catch { /* 读取失败时保留默认高度 */ }
+  });
   return iframe;
 }
 
