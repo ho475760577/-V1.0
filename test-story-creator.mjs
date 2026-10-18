@@ -167,6 +167,36 @@ await test('草稿缺少关系阶段或触发规则时自动重试补齐机制',
   } }, { idea: '有阶段推进和分支条件的山城故事' });
   assert.equal(calls, 2);
 });
+await test('剧情机制兼容数组、对象和同义字段', async () => {
+  const draft = fixture();
+  draft.storyMechanics = undefined;
+  draft.mechanics = {
+    timeline: ['相遇', '共同调查', '根据选择进入不同结局'],
+    relationship_stages: [{ stage: '试探', condition: '共同确认线索' }],
+    eventTriggers: { condition: '找到旧信', consequence: '出现新证词' },
+    refusalConditions: ['被欺骗时暂停合作'],
+    aftermath: ['公开秘密会提高风险'],
+    npcActions: [{ name: '陈伯', action: '主动核对邮戳' }],
+  };
+  const result = await generateStoryDraft({ async chat() { return { content: JSON.stringify(draft) }; } }, { idea: '兼容机制格式' });
+  assert.match(result.storyMechanics.timeline, /相遇/);
+  assert.match(result.storyMechanics.relationshipStages, /共同确认线索/);
+  assert.match(result.storyMechanics.triggerRules, /找到旧信/);
+  assert.match(result.storyMechanics.npcAgency, /主动核对邮戳/);
+});
+await test('完整重试仍缺机制时定向修复并回填', async () => {
+  let calls = 0;
+  const repaired = { timeline: '按选择推进', relationshipStages: '共同经历后进入信任', triggerRules: '发现旧信后触发调查',
+    brakeConditions: '角色拒绝时暂停', consequences: '选择会改变风险', npcAgency: '配角主动核对线索' };
+  const result = await generateStoryDraft({ async chat(messages) {
+    calls++;
+    if (calls <= 2) { const draft = fixture(); delete draft.storyMechanics; return { content: JSON.stringify(draft) }; }
+    if (calls === 3) return { content: JSON.stringify({ storyMechanics: repaired }) };
+    return { content: JSON.stringify({ ...fixture(), storyMechanics: repaired }) };
+  } }, { idea: '需要机制修复的故事' });
+  assert.equal(calls, 4);
+  assert.equal(result.storyMechanics.npcAgency, repaired.npcAgency);
+});
 await test('模型损坏、截断、缺项与离线时不写入任何数据', async () => {
   seed(); const before = [...data];
   for (const output of ['无效', '[]', '{"title":"未完成"', '{}']) await assert.rejects(generateStoryDraft(mock(output), { idea: '故事' }));

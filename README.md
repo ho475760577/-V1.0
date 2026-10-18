@@ -1,4 +1,4 @@
-# 叙境 StoryRealm · v3.0.4
+# 叙境 StoryRealm · v3.0.5
 
 **让一个想法，成为可以走进去的故事。**
 
@@ -11,7 +11,7 @@
 - 原生 HTML / CSS / JavaScript，无前端构建步骤。
 - 作品和聊天即时保存在当前浏览器，并在使用一键启动脚本时自动同步到项目 `data/storyrealm-workspace.json`；连接本地模型时可离线使用。
 
-当前版本 **3.0.4**，界面标注为 **v3.0.4**。更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本 **3.0.5**，界面标注为 **v3.0.5**。更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 快速开始
 

@@ -17,6 +17,18 @@ export const STORY_STEPS = [
 
 const text = (value) => typeof value === 'string' ? value.trim()
   : typeof value === 'number' && Number.isFinite(value) ? String(value) : '';
+const richText = (value) => {
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (Array.isArray(value)) return value.map(richText).filter(Boolean).join('；');
+  if (value && typeof value === 'object') {
+    return Object.entries(value).map(([key, item]) => {
+      const result = richText(item);
+      return result ? `${key}：${result}` : '';
+    }).filter(Boolean).join('；');
+  }
+  return '';
+};
 const record = (value) => value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 const pick = (value, keys) => Object.fromEntries(keys.map((key) => [key, text(record(value)[key])]));
 const normalizeSceneDraft = (value) => {
@@ -45,6 +57,22 @@ export const STORY_PERSONA_FIELDS = ['name', 'identity', 'appearance', 'personal
 export const STORY_SUPPORT_FIELDS = ['name', 'identity', 'personality', 'appearance', 'background', 'relationship',
   'shortTermGoal', 'longTermGoal', 'fear', 'need', 'contradiction', 'boundaries', 'behaviorCues', 'arc'];
 export const STORY_MECHANIC_FIELDS = ['timeline', 'relationshipStages', 'triggerRules', 'brakeConditions', 'consequences', 'npcAgency'];
+const STORY_MECHANIC_ALIASES = {
+  timeline: ['timeline', 'timeLine', 'stages', 'phases', '阶段与时间线'],
+  relationshipStages: ['relationshipStages', 'relationship_stages', 'relationshipProgression', 'relationshipDynamics', '关系阶段', '关系推进'],
+  triggerRules: ['triggerRules', 'trigger_rules', 'eventTriggers', 'eventTriggerRules', '触发规则', '事件触发'],
+  brakeConditions: ['brakeConditions', 'brake_conditions', 'stopConditions', 'refusalConditions', '拒绝条件', '暂停条件'],
+  consequences: ['consequences', 'consequenceRules', 'choiceConsequences', 'aftermath', '后果', '选择后果'],
+  npcAgency: ['npcAgency', 'npc_agency', 'npcActions', 'supportingCharacterAgency', '配角自主行动', '配角行动'],
+};
+
+function normalizeStoryMechanics(value, root = {}) {
+  const source = { ...record(root.mechanics), ...record(root.story_mechanics), ...record(root.plotMechanics), ...record(value) };
+  return Object.fromEntries(STORY_MECHANIC_FIELDS.map((key) => {
+    const alias = STORY_MECHANIC_ALIASES[key].find((name) => source[name] != null);
+    return [key, alias ? richText(source[alias]) : ''];
+  }));
+}
 
 export function storyAnswers(source = {}, before = STORY_STEPS.length) {
   return Object.fromEntries(STORY_STEPS.slice(0, before).map((step) => [step.key, text(source[step.key])]).filter(([, value]) => value));
@@ -74,7 +102,7 @@ export function normalizeStoryDraft(value) {
     scene: normalizeSceneDraft(raw.scene),
     supportingCharacters: (Array.isArray(raw.supportingCharacters) ? raw.supportingCharacters : []).slice(0, 4)
       .map((person) => pick(person, STORY_SUPPORT_FIELDS)).filter((person) => person.name),
-    storyMechanics: pick(raw.storyMechanics, STORY_MECHANIC_FIELDS),
+    storyMechanics: normalizeStoryMechanics(raw.storyMechanics, raw),
     worldbook: (Array.isArray(raw.worldbook) ? raw.worldbook : []).slice(0, 8).map((item) => ({
       ...pick(item, ['name', 'content', 'relationshipStage']),
       type: ['general', 'character', 'location', 'organization', 'rule', 'item', 'event', 'relationship'].includes(text(item?.type)) ? text(item.type) : 'general',
@@ -129,6 +157,7 @@ export async function generateStoryDraft(llm, answers) {
 gender 只用 male/female/custom/空字符串，自定义说明写 genderCustom。字段使用字符串，supportingCharacters/worldbook 使用数组；无配角或额外世界书时返回空数组。storyMechanics 每项写成可执行的简短规则，不能把具体事件写成必然发生的剧情。必须填写 title、premise、world、character.name、人物基本设定、persona.identity 和 opening。`;
   const user = { role: 'user', content: JSON.stringify({ 访谈回答: input }) };
   let firstError;
+  let lastError;
   try {
     const output = await llm.chat([{ role: 'system', content: system }, user], {
       max_tokens: 6000, temperature: 0.75, response_format: { type: 'json_object' },
@@ -136,6 +165,7 @@ gender 只用 male/female/custom/空字符串，自定义说明写 genderCustom�
     return parseGeneratedDraft(output.content);
   } catch (error) {
     firstError = error;
+    lastError = error;
   }
 
   // 小模型偶尔会在嵌套 JSON 的末尾截断；用更明确的短指令自动重试一次，保留原始错误给最终提示。
@@ -145,9 +175,34 @@ gender 只用 male/female/custom/空字符串，自定义说明写 genderCustom�
       user,
     ], { max_tokens: 6000, temperature: 0.55, response_format: { type: 'json_object' } });
     return parseGeneratedDraft(retry.content);
-  } catch {
-    throw firstError;
+  } catch (error) {
+    lastError = error;
   }
+
+  // 许多本地模型能完成主体草稿，却漏掉或压缩剧情机制。单独修复机制，
+  // 避免再次生成整份长 JSON 时重复丢字段。
+  const retryErrors = [firstError, lastError].map((error) => error?.message || '').join('\n');
+  if (/剧情推进机制/.test(retryErrors)) {
+    try {
+      const repair = await llm.chat([
+        { role: 'system', content: '你是中文互动小说结构修复器。只输出一个 JSON 对象，必须包含 timeline、relationshipStages、triggerRules、brakeConditions、consequences、npcAgency 六个字段；每项可以是字符串或数组，但必须写成可执行、可分支的规则。不要输出解释、代码围栏或故事正文。' },
+        { role: 'user', content: JSON.stringify({ 访谈回答: input, 需要补全的字段: STORY_MECHANIC_FIELDS, 说明: '关系变化要有进入、停滞和退回条件；事件要有必要条件、排除条件、风险和可能后果；拒绝与暂停必须被尊重；配角要有独立目标和主动行动。' }) },
+      ], { max_tokens: 1800, temperature: 0.45, response_format: { type: 'json_object' } });
+      const repairedPayload = safeJson(repair.content || '') || {};
+      const mechanics = normalizeStoryMechanics(repairedPayload.storyMechanics || repairedPayload, repairedPayload);
+      if (STORY_MECHANIC_FIELDS.some((key) => !mechanics[key])) throw lastError;
+      // 只返回机制对象时，补成可继续编辑的最小草稿仍需主体字段；
+      // 因此把机制修复结果放回完整生成重试的输出由模型负责。
+      const retry = await llm.chat([
+        { role: 'system', content: `${system}\n这是机制修复后的最后一次完整生成。必须把下面六项原样放入 storyMechanics，并完整返回所有字段。` },
+        { role: 'user', content: JSON.stringify({ 访谈回答: input, 已修复剧情机制: mechanics }) },
+      ], { max_tokens: 6000, temperature: 0.5, response_format: { type: 'json_object' } });
+      return parseGeneratedDraft(retry.content);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || firstError;
 }
 
 /** 只组装，不写存储；预览、取消或生成失败不会修改当前作品。 */

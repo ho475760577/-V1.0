@@ -1,5 +1,11 @@
 # 叙境 StoryRealm 更新记录
 
+## 3.0.5 — 2026-10-18
+
+- 修复 AI 创作向导因机制字段被模型写成数组、对象或同义字段而误报缺少 `relationshipStages`、`triggerRules`、`brakeConditions`、`consequences`、`npcAgency`。
+- 完整草稿重试仍缺少机制时，增加定向机制修复和回填生成流程。
+- 前端缓存版本更新，避免继续使用旧版向导脚本。
+
 ## 3.0.4 — 2026-10-18
 
 - 剧情记忆改为 Markdown 主格式：模型、编辑框和后续提示词使用可读的记忆档案。
